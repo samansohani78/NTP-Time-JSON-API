@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ntp-time-api
+  labels:
+    app: ntp-time-api
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ntp-time-api
+  template:
+    metadata:
+      labels:
+        app: ntp-time-api
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: ntp-time-api
+        image: ntp-time-api:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        env:
+        - name: ADDR
+          value: "0.0.0.0:8080"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_FORMAT
+          value: "json"
+        - name: NTP_SERVERS
+          valueFrom:
+            configMapKeyRef:
+              name: ntp-time-api-config
+              key: ntp_servers
+        - name: SYNC_INTERVAL
+          value: "30"
+        - name: NTP_TIMEOUT
+          value: "2"
+        - name: MAX_STALENESS
+          value: "120"
+        - name: REQUIRE_SYNC
+          value: "true"
+        - name: MONOTONIC_OUTPUT
+          value: "true"
+        - name: SAMPLE_SERVERS_PER_SYNC
+          value: "3"
+        - name: MAX_OFFSET_SKEW_MS
+          value: "1000"
+        - name: REQUEST_TIMEOUT
+          value: "5"
+        - name: BODY_LIMIT_BYTES
+          value: "1024"
+        # Persian/Farsi messages (example)
+        - name: MSG_OK
+          value: "done"
+        - name: MSG_ERROR
+          value: "error"
+        - name: ERROR_TEXT_NO_SYNC
+          value: "Service not yet synchronized with NTP"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        startupProbe:
+          httpGet:
+            path: /startupz
+            port: http
+          initialDelaySeconds: 0
+          periodSeconds: 2
+          timeoutSeconds: 3
+          failureThreshold: 30
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

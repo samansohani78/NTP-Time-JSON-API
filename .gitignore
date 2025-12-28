@@ -1,0 +1,45 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+
+# Debug
+debug/
+
+# Test coverage
+*.profraw
+*.profdata
+
+# MD Files
+CHANGELOG.md
+CLAUDE.md
+PROJECT_SUMMARY.md
+REQUIREMENTS_CHECKLIST.md
+
+# Docker
+docker-compose.override.yml
+*.log
+
+# Temporary files
+*.tmp
+.tmp/
+tmp/

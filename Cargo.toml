@@ -1,0 +1,56 @@
+[package]
+name = "ntp-time-json-api"
+version = "0.1.0"
+edition = "2024"
+authors = ["NTP Time API Team"]
+description = "Production-ready HTTP service for NTP-derived time as JSON"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "timeout", "limit", "request-id", "util"] }
+hyper = { version = "1.8", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+# Async runtime
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# NTP client
+rsntp = "4.1"
+
+# Metrics
+prometheus-client = "0.24"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Utilities
+rand = "0.8"
+parking_lot = "0.12"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+opt-level = 1

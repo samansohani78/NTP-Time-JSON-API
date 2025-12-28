@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ntp-time-api-config
+  labels:
+    app: ntp-time-api
+data:
+  ntp_servers: "time.google.com:123,time.cloudflare.com:123,pool.ntp.org:123"
