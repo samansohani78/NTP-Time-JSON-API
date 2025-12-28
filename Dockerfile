@@ -20,39 +20,15 @@ COPY tests ./tests
 # Build the application
 RUN cargo build --release --bin ntp-time-json-api
 
-# Runtime stage - using debian bookworm (stable)
-FROM debian:bookworm-slim
+# Runtime stage - using distroless (minimal, stateless, secure)
+# gcr.io/distroless/cc-debian12 includes glibc and OpenSSL needed for Rust
+FROM gcr.io/distroless/cc-debian13:nonroot
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN useradd -r -u 1000 -s /bin/false ntpapi
-
-# Create app directory
-WORKDIR /app
-
-# Copy binary from builder
-COPY --from=builder /app/target/release/ntp-time-json-api /app/ntp-time-json-api
-
-# Change ownership
-RUN chown -R ntpapi:ntpapi /app
-
-# Switch to non-root user
-USER ntpapi
+# Copy binary from builder (distroless uses / as workdir)
+COPY --from=builder /app/target/release/ntp-time-json-api /ntp-time-json-api
 
 # Expose HTTP port
 EXPOSE 8080
 
-# Set default environment variables
-ENV LOG_LEVEL=info \
-    LOG_FORMAT=json \
-    ADDR=0.0.0.0:8080 \
-    RUST_BACKTRACE=1
-
-# Run the binary
-CMD ["/app/ntp-time-json-api"]
+# Run as non-root user (distroless nonroot = UID 65532, no shell available)
+ENTRYPOINT ["/ntp-time-json-api"]
