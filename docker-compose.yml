@@ -11,6 +11,14 @@ services:
       - ADDR=0.0.0.0:8080
       - REQUEST_TIMEOUT=5
       - BODY_LIMIT_BYTES=1024
+      - TCP_NODELAY=true
+      - TCP_KEEPALIVE_SECS=60
+      - GRPC_ENABLED=false
+      - GRPC_ADDR=0.0.0.0:50051
+
+      # WebSocket Configuration
+      - WS_UPDATE_INTERVAL_MS=1000
+      - WS_MAX_DURATION_SECS=3600
 
       # Logging Configuration
       - LOG_LEVEL=info

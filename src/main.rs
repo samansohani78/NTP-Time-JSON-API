@@ -1,8 +1,10 @@
 mod config;
 mod errors;
+// mod grpc_service; // Disabled - requires tonic-build API fixes
 mod http;
 mod metrics;
 mod ntp;
+mod performance;
 mod timebase;
 
 use config::Config;
@@ -32,13 +34,20 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize components
-    let timebase = TimeBase::new(config.ntp.monotonic_output);
+    let time_cache = Arc::new(performance::TimeCache::new(
+        config.messages.ok.clone(),
+        config.messages.ok_cache.clone(),
+    ));
+    let perf_metrics = Arc::new(performance::LockFreeMetrics::new());
+    let timebase = TimeBase::new(config.ntp.monotonic_output).with_cache(time_cache.clone());
     let metrics = Arc::new(Metrics::new());
     let ntp_syncer = Arc::new(NtpSyncer::new(Arc::new(config.ntp.clone())));
     let state = Arc::new(AppState::new(
         config.clone(),
         timebase.clone(),
         metrics.clone(),
+        time_cache.clone(),
+        perf_metrics.clone(),
     ));
 
     // Start background sync loop
@@ -59,18 +68,69 @@ async fn main() -> anyhow::Result<()> {
     // Create HTTP router
     let app = http::create_router(state.clone());
 
-    // Start HTTP server
-    let listener = tokio::net::TcpListener::bind(&config.http.addr)
-        .await
-        .expect("Failed to bind to address");
+    // Start HTTP server with TCP optimizations
+    let listener = {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::SocketAddr as StdSocketAddr;
 
-    info!(addr = %config.http.addr, "HTTP server listening");
+        let addr: StdSocketAddr = config.http.addr;
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
 
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .expect("Failed to create socket");
 
-    // Run server and wait for shutdown
-    if let Err(e) = server.await {
-        error!(error = %e, "Server error");
+        // Enable SO_REUSEADDR for faster restarts
+        socket
+            .set_reuse_address(true)
+            .expect("Failed to set SO_REUSEADDR");
+
+        // Enable TCP_NODELAY for lower latency (disable Nagle's algorithm)
+        if config.http.tcp_nodelay {
+            socket
+                .set_tcp_nodelay(true)
+                .expect("Failed to set TCP_NODELAY");
+        }
+
+        // Enable TCP keepalive if configured
+        if let Some(keepalive_secs) = config.http.tcp_keepalive_secs {
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(keepalive_secs));
+            socket
+                .set_tcp_keepalive(&keepalive)
+                .expect("Failed to set TCP keepalive");
+        }
+
+        socket
+            .set_nonblocking(true)
+            .expect("Failed to set non-blocking");
+        socket.bind(&addr.into()).expect("Failed to bind");
+        socket.listen(1024).expect("Failed to listen");
+
+        tokio::net::TcpListener::from_std(socket.into())
+            .expect("Failed to convert to tokio listener")
+    };
+
+    info!(
+        addr = %config.http.addr,
+        tcp_nodelay = config.http.tcp_nodelay,
+        tcp_keepalive = ?config.http.tcp_keepalive_secs,
+        "HTTP server listening"
+    );
+
+    let http_server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+
+    // gRPC server (disabled - requires tonic-build API fixes)
+    if config.http.grpc_enabled {
+        warn!("gRPC server requested but not available (disabled in build)");
+    }
+
+    // Run HTTP server and wait for shutdown
+    if let Err(e) = http_server.await {
+        error!(error = %e, "HTTP server error");
     }
 
     info!("Shutting down...");

@@ -1,0 +1,293 @@
+{
+  "dashboard": {
+    "title": "NTP Time API - NTP Health",
+    "tags": ["ntp-time-api", "ntp", "health"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "NTP Server Status",
+        "type": "stat",
+        "gridPos": {"h": 6, "w": 24, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "ntp_server_up{app=\"ntp-time-api\"}",
+            "legendFormat": "{{server}}",
+            "refId": "A",
+            "instant": true
+          }
+        ],
+        "options": {
+          "colorMode": "background",
+          "graphMode": "none",
+          "orientation": "auto",
+          "textMode": "value_and_name"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "mappings": [
+              {"type": "value", "value": "1", "text": "UP"},
+              {"type": "value", "value": "0", "text": "DOWN"}
+            ],
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "steps": [
+                {"value": null, "color": "red"},
+                {"value": 1, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "NTP Server RTT (ms)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+        "targets": [
+          {
+            "expr": "ntp_server_rtt_milliseconds{app=\"ntp-time-api\"}",
+            "legendFormat": "{{server}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ms", "label": "RTT"},
+          {"format": "short"}
+        ],
+        "tooltip": {"shared": true, "sort": 2},
+        "legend": {"show": true, "alignAsTable": true, "values": true, "current": true, "avg": true, "max": true, "min": true}
+      },
+      {
+        "id": 3,
+        "title": "Time Staleness (seconds)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+        "targets": [
+          {
+            "expr": "ntp_staleness_seconds{app=\"ntp-time-api\"}",
+            "legendFormat": "Staleness",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Staleness"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [120], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "for": "5m",
+          "frequency": "1m",
+          "name": "High Staleness Alert"
+        },
+        "thresholds": [
+          {"value": 60, "colorMode": "custom", "op": "gt", "fill": false, "line": true, "fillColor": "rgba(255, 223, 0, 0.2)", "lineColor": "rgb(255, 223, 0)"},
+          {"value": 120, "colorMode": "critical", "op": "gt", "fill": true, "line": true}
+        ]
+      },
+      {
+        "id": 4,
+        "title": "NTP Sync Errors (rate)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+        "targets": [
+          {
+            "expr": "rate(ntp_sync_errors_total{app=\"ntp-time-api\"}[5m])",
+            "legendFormat": "Sync Errors/sec",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Errors/sec"},
+          {"format": "short"}
+        ],
+        "tooltip": {"shared": true, "sort": 2}
+      },
+      {
+        "id": 5,
+        "title": "Consecutive Failures",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+        "targets": [
+          {
+            "expr": "ntp_consecutive_failures{app=\"ntp-time-api\"}",
+            "legendFormat": "{{server}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Failures"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [10], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "for": "5m",
+          "frequency": "1m",
+          "name": "NTP Sync Failing Alert"
+        },
+        "thresholds": [
+          {"value": 5, "colorMode": "custom", "op": "gt", "fill": false, "line": true, "fillColor": "rgba(255, 223, 0, 0.2)", "lineColor": "rgb(255, 223, 0)"},
+          {"value": 10, "colorMode": "critical", "op": "gt", "fill": true, "line": true}
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Healthy Servers Count",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 8, "x": 0, "y": 22},
+        "targets": [
+          {
+            "expr": "sum(ntp_server_up{app=\"ntp-time-api\"})",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto",
+          "textMode": "auto"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "steps": [
+                {"value": null, "color": "red"},
+                {"value": 1, "color": "yellow"},
+                {"value": 2, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "title": "Min RTT",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 8, "x": 8, "y": 22},
+        "targets": [
+          {
+            "expr": "min(ntp_server_rtt_milliseconds{app=\"ntp-time-api\"})",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto",
+          "textMode": "auto"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms",
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "steps": [
+                {"value": null, "color": "green"},
+                {"value": 100, "color": "yellow"},
+                {"value": 500, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "title": "Current Staleness",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 8, "x": 16, "y": 22},
+        "targets": [
+          {
+            "expr": "ntp_staleness_seconds{app=\"ntp-time-api\"}",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto",
+          "textMode": "auto"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "steps": [
+                {"value": null, "color": "green"},
+                {"value": 60, "color": "yellow"},
+                {"value": 120, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "title": "NTP Sync Success Rate",
+        "type": "gauge",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 26},
+        "targets": [
+          {
+            "expr": "100 * (1 - (rate(ntp_sync_errors_total{app=\"ntp-time-api\"}[5m]) / (rate(ntp_sync_errors_total{app=\"ntp-time-api\"}[5m]) + 1)))",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "showThresholdLabels": true,
+          "showThresholdMarkers": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "steps": [
+                {"value": null, "color": "red"},
+                {"value": 90, "color": "yellow"},
+                {"value": 99, "color": "green"}
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "query": "prometheus",
+          "current": {"value": "Prometheus", "text": "Prometheus"}
+        }
+      ]
+    },
+    "time": {"from": "now-1h", "to": "now"},
+    "timepicker": {"refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m"]}
+  }
+}

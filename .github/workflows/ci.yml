@@ -124,11 +124,26 @@ jobs:
           path: target/release/ntp-time-json-api
           retention-days: 7
 
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+
   docker:
     name: Docker Build
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fmt, clippy, test]
+    needs: [fmt, clippy, test, security-audit]
     steps:
       - uses: actions/checkout@v4
 
@@ -143,6 +158,15 @@ jobs:
           tags: ntp-time-api:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          load: true
+
+      - name: Run Trivy security scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ntp-time-api:latest
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
 
       # Uncomment to push to registry
       # - name: Login to Docker Hub

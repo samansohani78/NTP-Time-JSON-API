@@ -94,6 +94,54 @@ Startup probe - returns 503 until first successful sync.
 
 Prometheus metrics in text exposition format.
 
+### `WS /stream` (WebSocket)
+
+Real-time time streaming endpoint. Connects via WebSocket and receives periodic time updates.
+
+**Configuration:**
+- `WS_UPDATE_INTERVAL_MS` - Update interval in milliseconds (default: 1000)
+- `WS_MAX_DURATION_SECS` - Maximum connection duration in seconds (default: 3600)
+
+**Welcome Message:**
+```json
+{
+  "type": "welcome",
+  "message": "Connected to NTP Time JSON API WebSocket",
+  "update_interval_ms": 1000,
+  "max_duration_secs": 3600
+}
+```
+
+**Time Update Messages:**
+```json
+{
+  "type": "tick",
+  "epoch_ms": 1735446000000,
+  "iso8601": "2024-12-29T00:00:00+00:00",
+  "is_stale": false,
+  "staleness_secs": 12,
+  "message": "done",
+  "sequence": 42
+}
+```
+
+**Usage Examples:**
+```javascript
+// Browser
+const ws = new WebSocket('ws://localhost:8080/stream');
+ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    console.log('Time:', data.epoch_ms, data.iso8601);
+};
+```
+
+```bash
+# CLI (using websocat)
+websocat ws://localhost:8080/stream
+```
+
+See `test_websocket.html` for an interactive test client.
+
 ## Configuration
 
 All configuration via environment variables:
@@ -358,6 +406,55 @@ A GitHub Actions workflow is provided in `.github/workflows/ci.yml`:
 - Verify Prometheus annotations on pod
 - Or apply ServiceMonitor if using Prometheus Operator
 - Check `/metrics` endpoint manually
+
+## Benchmarking
+
+Performance testing tools are provided for both HTTP and WebSocket endpoints:
+
+### HTTP/REST Benchmark
+
+```bash
+# Run default benchmark (1000 requests, 10 concurrent)
+./benchmark.sh
+
+# Custom parameters
+./benchmark.sh http://localhost:8080/time 5000 50
+```
+
+**Example output:**
+```
+Requests/sec:      1,848.96
+P50 Latency:       0.51ms
+P95 Latency:       0.80ms
+P99 Latency:       1.47ms
+```
+
+### WebSocket Benchmark
+
+```bash
+# Install Python websockets library
+pip install websockets
+
+# Run default benchmark (10 seconds, 1 connection)
+./benchmark_websocket.py
+
+# Custom parameters
+./benchmark_websocket.py --duration 30 --connections 10
+```
+
+**Example output:**
+```
+Messages Received:
+  Total:           300
+  Rate:            30.0 msg/s
+
+Message Latency (ms):
+  Avg:             1.234
+  P95:             2.100
+  P99:             3.500
+```
+
+**See also**: `PROTOCOL_COMPARISON.md` for detailed performance analysis of all protocols.
 
 ## License
 

@@ -16,6 +16,10 @@ pub struct HttpConfig {
     pub addr: SocketAddr,
     pub request_timeout_secs: u64,
     pub body_limit_bytes: usize,
+    pub tcp_nodelay: bool,
+    pub tcp_keepalive_secs: Option<u64>,
+    pub grpc_enabled: bool,
+    pub grpc_addr: SocketAddr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +91,15 @@ impl Config {
             .context("Failed to parse ADDR")?;
         let request_timeout_secs = env_or_parse("REQUEST_TIMEOUT", 5);
         let body_limit_bytes = env_or_parse("BODY_LIMIT_BYTES", 1024);
+        let tcp_nodelay = env_or_parse("TCP_NODELAY", true);
+        let tcp_keepalive_secs = match env_or_parse("TCP_KEEPALIVE_SECS", 0) {
+            0 => None,
+            n => Some(n),
+        };
+        let grpc_enabled = env_or_parse("GRPC_ENABLED", false); // Disabled by default
+        let grpc_addr = env_or_default("GRPC_ADDR", "0.0.0.0:50051")
+            .parse()
+            .context("Failed to parse GRPC_ADDR")?;
 
         // Logging config
         let level = env_or_default("LOG_LEVEL", "info");
@@ -154,6 +167,10 @@ impl Config {
                 addr,
                 request_timeout_secs,
                 body_limit_bytes,
+                tcp_nodelay,
+                tcp_keepalive_secs,
+                grpc_enabled,
+                grpc_addr,
             },
             ntp: NtpConfig {
                 servers,
@@ -223,6 +240,10 @@ impl Default for Config {
                 addr: "0.0.0.0:8080".parse().unwrap(),
                 request_timeout_secs: 5,
                 body_limit_bytes: 1024,
+                tcp_nodelay: true,
+                tcp_keepalive_secs: Some(60),
+                grpc_enabled: false, // Disabled in tests
+                grpc_addr: "0.0.0.0:50051".parse().unwrap(),
             },
             ntp: NtpConfig {
                 servers: vec!["time.google.com:123".to_string()],

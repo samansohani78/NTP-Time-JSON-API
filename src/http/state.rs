@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::metrics::SharedMetrics;
+use crate::performance::{LockFreeMetrics, TimeCache};
 use crate::timebase::TimeBase;
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,16 +10,26 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub timebase: TimeBase,
     pub metrics: SharedMetrics,
+    pub time_cache: Arc<TimeCache>,
+    pub perf_metrics: Arc<LockFreeMetrics>,
     pub last_sync_time: Arc<parking_lot::RwLock<Option<Instant>>>,
     pub consecutive_failures: Arc<parking_lot::RwLock<u32>>,
 }
 
 impl AppState {
-    pub fn new(config: Arc<Config>, timebase: TimeBase, metrics: SharedMetrics) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        timebase: TimeBase,
+        metrics: SharedMetrics,
+        time_cache: Arc<TimeCache>,
+        perf_metrics: Arc<LockFreeMetrics>,
+    ) -> Self {
         Self {
             config,
             timebase,
             metrics,
+            time_cache,
+            perf_metrics,
             last_sync_time: Arc::new(parking_lot::RwLock::new(None)),
             consecutive_failures: Arc::new(parking_lot::RwLock::new(0)),
         }

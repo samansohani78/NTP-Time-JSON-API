@@ -1,6 +1,7 @@
 pub mod handlers;
 pub mod middleware;
 pub mod state;
+pub mod websocket;
 
 use axum::{Router, http::StatusCode, middleware as axum_middleware, routing::get};
 use state::AppState;
@@ -19,12 +20,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Main endpoints
         .route("/time", get(handlers::time_handler))
         .route("/", get(handlers::time_handler)) // Alias
+        // WebSocket endpoint
+        .route("/stream", get(websocket::websocket_handler))
         // Probe endpoints
         .route("/healthz", get(handlers::healthz_handler))
         .route("/readyz", get(handlers::readyz_handler))
         .route("/startupz", get(handlers::startupz_handler))
         // Metrics
         .route("/metrics", get(handlers::metrics_handler))
+        .route("/performance", get(handlers::performance_handler))
         .with_state(state.clone())
         // Middleware - applied bottom-up
         .layer(axum_middleware::from_fn_with_state(
@@ -54,10 +58,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_creation() {
+        use crate::performance::{LockFreeMetrics, TimeCache};
+
         let config = Arc::new(Config::default());
-        let timebase = TimeBase::new(true);
+        let time_cache = Arc::new(TimeCache::new(
+            config.messages.ok.clone(),
+            config.messages.ok_cache.clone(),
+        ));
+        let perf_metrics = Arc::new(LockFreeMetrics::new());
+        let timebase = TimeBase::new(true).with_cache(time_cache.clone());
         let metrics = Arc::new(Metrics::new());
-        let state = Arc::new(AppState::new(config, timebase, metrics));
+        let state = Arc::new(AppState::new(
+            config,
+            timebase,
+            metrics,
+            time_cache,
+            perf_metrics,
+        ));
 
         let app = create_router(state);
 

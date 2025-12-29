@@ -1,0 +1,22 @@
+{
+  "name": "ntp-time-api-examples",
+  "version": "1.0.0",
+  "description": "Example clients for NTP Time JSON API",
+  "main": "client.js",
+  "scripts": {
+    "client": "node client.js",
+    "websocket": "node websocket_client.js"
+  },
+  "keywords": [
+    "ntp",
+    "time",
+    "api",
+    "client"
+  ],
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

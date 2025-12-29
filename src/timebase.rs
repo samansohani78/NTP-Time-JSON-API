@@ -1,4 +1,5 @@
 use crate::ntp::SyncResult;
+use crate::performance::TimeCache;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Instant;
@@ -22,6 +23,9 @@ pub struct TimeBase {
 
     /// Whether we've had at least one successful sync
     has_synced: Arc<AtomicBool>,
+
+    /// Optional zero-copy JSON cache
+    time_cache: Option<Arc<TimeCache>>,
 }
 
 impl TimeBase {
@@ -32,7 +36,13 @@ impl TimeBase {
             last_served_ms: Arc::new(AtomicI64::new(0)),
             monotonic_output,
             has_synced: Arc::new(AtomicBool::new(false)),
+            time_cache: None,
         }
+    }
+
+    pub fn with_cache(mut self, cache: Arc<TimeCache>) -> Self {
+        self.time_cache = Some(cache);
+        self
     }
 
     /// Update the time base with a new NTP sync result
@@ -45,6 +55,11 @@ impl TimeBase {
         *self.base_instant.write() = Some(now);
 
         self.has_synced.store(true, Ordering::SeqCst);
+
+        // Update zero-copy cache if available
+        if let Some(cache) = &self.time_cache {
+            cache.update(sync_result.epoch_ms, false);
+        }
 
         debug!(
             base_epoch_ms = sync_result.epoch_ms,

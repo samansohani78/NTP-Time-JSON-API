@@ -35,6 +35,7 @@ CLAUDE.md
 PROJECT_SUMMARY.md
 REQUIREMENTS_CHECKLIST.md
 IDEAS.md
+*.md
 
 # Docker
 docker-compose.override.yml

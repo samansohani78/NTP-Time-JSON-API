@@ -84,7 +84,8 @@ impl NtpSyncer {
                     warn!(server = %server, error = %e, "NTP query failed");
                     let mut stats_write = self.stats.write().await;
                     if let Some(stat) = stats_write.get_mut(&server) {
-                        let just_disabled = stat.record_failure(self.config.max_consecutive_failures);
+                        let just_disabled =
+                            stat.record_failure(self.config.max_consecutive_failures);
                         if just_disabled {
                             warn!(
                                 server = %server,
@@ -100,7 +101,8 @@ impl NtpSyncer {
                     error!(server = %server, error = %e, "NTP query task panicked");
                     let mut stats_write = self.stats.write().await;
                     if let Some(stat) = stats_write.get_mut(&server) {
-                        let just_disabled = stat.record_failure(self.config.max_consecutive_failures);
+                        let just_disabled =
+                            stat.record_failure(self.config.max_consecutive_failures);
                         if just_disabled {
                             warn!(
                                 server = %server,

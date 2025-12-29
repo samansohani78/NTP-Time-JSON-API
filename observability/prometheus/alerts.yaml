@@ -1,0 +1,220 @@
+groups:
+- name: ntp_time_api_alerts
+  interval: 30s
+  rules:
+  #
+  # HTTP / Service Availability Alerts
+  #
+  - alert: HighErrorRate
+    expr: |
+      100 * (
+        rate(http_requests_total{app="ntp-time-api",status=~"5.."}[5m])
+        /
+        rate(http_requests_total{app="ntp-time-api"}[5m])
+      ) > 5
+    for: 5m
+    labels:
+      severity: critical
+      component: http
+    annotations:
+      summary: "High error rate detected ({{ $value | humanizePercentage }})"
+      description: "NTP Time API is experiencing {{ $value | humanizePercentage }} 5xx error rate for the last 5 minutes on {{ $labels.instance }}"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#high-error-rate"
+
+  - alert: HighLatency
+    expr: |
+      histogram_quantile(0.99,
+        rate(http_request_duration_seconds_bucket{app="ntp-time-api"}[5m])
+      ) > 0.1
+    for: 10m
+    labels:
+      severity: warning
+      component: http
+    annotations:
+      summary: "High P99 latency detected ({{ $value | humanizeDuration }})"
+      description: "NTP Time API P99 latency is {{ $value | humanizeDuration }}, above 100ms threshold"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#high-latency"
+
+  - alert: ServiceDown
+    expr: up{job="ntp-time-api"} == 0
+    for: 1m
+    labels:
+      severity: critical
+      component: infrastructure
+    annotations:
+      summary: "Service instance down"
+      description: "NTP Time API instance {{ $labels.instance }} is down"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#service-down"
+
+  - alert: LowAvailability
+    expr: |
+      (
+        sum(rate(http_requests_total{app="ntp-time-api",status=~"2.."}[5m]))
+        /
+        sum(rate(http_requests_total{app="ntp-time-api"}[5m]))
+      ) < 0.999
+    for: 15m
+    labels:
+      severity: warning
+      component: slo
+    annotations:
+      summary: "Service availability below SLO ({{ $value | humanizePercentage }})"
+      description: "NTP Time API availability is {{ $value | humanizePercentage }}, below 99.9% SLO"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#low-availability"
+
+  #
+  # NTP Sync Alerts
+  #
+  - alert: NTPSyncFailing
+    expr: ntp_consecutive_failures{app="ntp-time-api"} > 10
+    for: 5m
+    labels:
+      severity: critical
+      component: ntp
+    annotations:
+      summary: "NTP sync failing for server {{ $labels.server }}"
+      description: "NTP server {{ $labels.server }} has {{ $value }} consecutive failures"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#ntp-sync-failing"
+
+  - alert: AllNTPServersFailed
+    expr: sum(ntp_server_up{app="ntp-time-api"}) == 0
+    for: 2m
+    labels:
+      severity: critical
+      component: ntp
+    annotations:
+      summary: "All NTP servers have failed"
+      description: "All NTP servers are unreachable. Service may be returning stale time."
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#all-ntp-servers-failed"
+
+  - alert: HighTimeStaleness
+    expr: ntp_staleness_seconds{app="ntp-time-api"} > 120
+    for: 5m
+    labels:
+      severity: warning
+      component: ntp
+    annotations:
+      summary: "Time data is stale ({{ $value }}s old)"
+      description: "NTP Time API time data is {{ $value }} seconds old, exceeding 120s threshold"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#high-time-staleness"
+
+  - alert: NTPServerDegraded
+    expr: ntp_server_rtt_milliseconds{app="ntp-time-api"} > 500
+    for: 10m
+    labels:
+      severity: warning
+      component: ntp
+    annotations:
+      summary: "NTP server {{ $labels.server }} has high RTT"
+      description: "NTP server {{ $labels.server }} RTT is {{ $value }}ms, above 500ms threshold"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#ntp-server-degraded"
+
+  #
+  # Infrastructure Alerts
+  #
+  - alert: PodDown
+    expr: |
+      kube_deployment_status_replicas_available{deployment="ntp-time-api"} < 2
+    for: 5m
+    labels:
+      severity: warning
+      component: infrastructure
+    annotations:
+      summary: "Less than 2 pods available"
+      description: "NTP Time API has {{ $value }} pods available, below minimum of 2"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#pod-down"
+
+  - alert: HighMemoryUsage
+    expr: |
+      container_memory_usage_bytes{pod=~"ntp-time-api.*"}
+      /
+      container_spec_memory_limit_bytes{pod=~"ntp-time-api.*"}
+      > 0.8
+    for: 10m
+    labels:
+      severity: warning
+      component: infrastructure
+    annotations:
+      summary: "High memory usage ({{ $value | humanizePercentage }})"
+      description: "Pod {{ $labels.pod }} is using {{ $value | humanizePercentage }} of memory limit"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#high-memory-usage"
+
+  - alert: HighCPUUsage
+    expr: |
+      rate(container_cpu_usage_seconds_total{pod=~"ntp-time-api.*"}[5m])
+      /
+      container_spec_cpu_quota{pod=~"ntp-time-api.*"}
+      > 0.8
+    for: 10m
+    labels:
+      severity: warning
+      component: infrastructure
+    annotations:
+      summary: "High CPU usage ({{ $value | humanizePercentage }})"
+      description: "Pod {{ $labels.pod }} is using {{ $value | humanizePercentage }} of CPU limit"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#high-cpu-usage"
+
+  - alert: PodCrashLooping
+    expr: |
+      rate(kube_pod_container_status_restarts_total{pod=~"ntp-time-api.*"}[15m]) > 0
+    for: 5m
+    labels:
+      severity: critical
+      component: infrastructure
+    annotations:
+      summary: "Pod is crash-looping"
+      description: "Pod {{ $labels.pod }} is restarting frequently"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#pod-crash-looping"
+
+  #
+  # Capacity Planning Alerts
+  #
+  - alert: HighThroughput
+    expr: |
+      sum(rate(http_requests_total{app="ntp-time-api"}[5m])) > 5000
+    for: 30m
+    labels:
+      severity: info
+      component: capacity
+    annotations:
+      summary: "High request throughput detected"
+      description: "NTP Time API is serving {{ $value | humanize }} requests/sec, consider scaling"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#high-throughput"
+
+  - alert: LowCacheHitRate
+    expr: |
+      (cache_hits / (cache_hits + total_requests - cache_hits)) < 0.8
+    for: 30m
+    labels:
+      severity: info
+      component: performance
+    annotations:
+      summary: "Low cache hit rate ({{ $value | humanizePercentage }})"
+      description: "Cache hit rate is {{ $value | humanizePercentage }}, below 80% expected"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#low-cache-hit-rate"
+
+  #
+  # Security / Operational Alerts
+  #
+  - alert: TLSCertificateExpiring
+    expr: |
+      (probe_ssl_earliest_cert_expiry - time()) / 86400 < 7
+    for: 1h
+    labels:
+      severity: warning
+      component: security
+    annotations:
+      summary: "TLS certificate expiring in {{ $value }} days"
+      description: "TLS certificate for {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#tls-certificate-expiring"
+
+  - alert: UnexpectedDeployment
+    expr: |
+      changes(build_info{app="ntp-time-api"}[5m]) > 0
+    labels:
+      severity: info
+      component: deployment
+    annotations:
+      summary: "Deployment detected"
+      description: "New version deployed: {{ $labels.version }} ({{ $labels.git_sha }})"
+      runbook_url: "https://github.com/your-org/ntp-time-api/blob/main/MONITORING_RUNBOOK.md#deployment"

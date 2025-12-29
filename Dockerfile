@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy source code and manifests
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src ./src
 COPY tests ./tests
 
@@ -21,7 +21,7 @@ COPY tests ./tests
 RUN cargo build --release --bin ntp-time-json-api
 
 # Runtime stage - using distroless (minimal, stateless, secure)
-# gcr.io/distroless/cc-debian12 includes glibc and OpenSSL needed for Rust
+# gcr.io/distroless/cc-debian13 includes glibc and OpenSSL needed for Rust
 FROM gcr.io/distroless/cc-debian13:nonroot
 
 # Copy binary from builder (distroless uses / as workdir)

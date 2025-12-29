@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package timeservice;
+
+// NTP Time Service - provides NTP-authoritative time via gRPC
+service TimeService {
+  // Get current NTP time (unary RPC)
+  rpc GetTime(TimeRequest) returns (TimeResponse);
+
+  // Stream time updates (server streaming RPC)
+  rpc StreamTime(StreamRequest) returns (stream TimeResponse);
+}
+
+// Request for current time
+message TimeRequest {
+  // Optional: client can request specific format
+  bool include_iso8601 = 1;
+}
+
+// Request for time stream
+message StreamRequest {
+  // Update interval in milliseconds (default: 1000ms)
+  uint32 interval_ms = 1;
+
+  // Maximum number of updates (0 = unlimited, default: 3600)
+  uint32 max_updates = 2;
+
+  // Include ISO8601 timestamp in responses
+  bool include_iso8601 = 3;
+}
+
+// Time response
+message TimeResponse {
+  // Epoch time in milliseconds
+  int64 epoch_ms = 1;
+
+  // ISO8601 formatted timestamp (optional)
+  string iso8601 = 2;
+
+  // Human-readable message
+  string message = 3;
+
+  // Whether this time is stale (from cache)
+  bool is_stale = 4;
+
+  // Staleness in seconds (0 if fresh)
+  uint64 staleness_secs = 5;
+
+  // Sequence number for streams
+  uint64 sequence = 6;
+}

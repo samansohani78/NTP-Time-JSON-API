@@ -1,0 +1,188 @@
+# Loki Stack Helm values for NTP Time API log aggregation
+# Install with: helm install loki grafana/loki-stack -f loki-stack-values.yaml
+
+loki:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 10Gi
+  config:
+    auth_enabled: false
+    ingester:
+      chunk_idle_period: 3m
+      chunk_block_size: 262144
+      chunk_retain_period: 1m
+      max_transfer_retries: 0
+      lifecycler:
+        ring:
+          kvstore:
+            store: inmemory
+          replication_factor: 1
+    limits_config:
+      enforce_metric_name: false
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h  # 7 days
+      ingestion_rate_mb: 10
+      ingestion_burst_size_mb: 20
+    schema_config:
+      configs:
+      - from: 2024-01-01
+        store: boltdb-shipper
+        object_store: filesystem
+        schema: v11
+        index:
+          prefix: index_
+          period: 24h
+    server:
+      http_listen_port: 3100
+    storage_config:
+      boltdb_shipper:
+        active_index_directory: /data/loki/boltdb-shipper-active
+        cache_location: /data/loki/boltdb-shipper-cache
+        cache_ttl: 24h
+        shared_store: filesystem
+      filesystem:
+        directory: /data/loki/chunks
+    chunk_store_config:
+      max_look_back_period: 0s
+    table_manager:
+      retention_deletes_enabled: true
+      retention_period: 168h  # 7 days
+
+promtail:
+  enabled: true
+  config:
+    clients:
+    - url: http://loki:3100/loki/api/v1/push
+    positions:
+      filename: /tmp/positions.yaml
+    scrape_configs:
+    # Scrape NTP Time API pods
+    - job_name: kubernetes-pods-app
+      pipeline_stages:
+      - docker: {}
+      - json:
+          expressions:
+            timestamp: timestamp
+            level: level
+            message: message
+            component: component
+            server: server
+      - labels:
+          level:
+          component:
+          server:
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: ntp-time-api
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        target_label: container
+
+grafana:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 5Gi
+  adminPassword: "changeme"
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://loki:3100
+        isDefault: false
+        jsonData:
+          maxLines: 1000
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus-server:80
+        isDefault: true
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+      - name: 'default'
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/default
+  dashboards:
+    default:
+      ntp-time-api-logs:
+        # LogQL Dashboard
+        json: |
+          {
+            "title": "NTP Time API - Logs",
+            "panels": [
+              {
+                "title": "Log Stream",
+                "type": "logs",
+                "targets": [
+                  {
+                    "expr": "{app=\"ntp-time-api\"}",
+                    "refId": "A"
+                  }
+                ]
+              },
+              {
+                "title": "Error Logs",
+                "type": "logs",
+                "targets": [
+                  {
+                    "expr": "{app=\"ntp-time-api\"} |= \"ERROR\"",
+                    "refId": "A"
+                  }
+                ]
+              },
+              {
+                "title": "Log Level Distribution",
+                "type": "bargauge",
+                "targets": [
+                  {
+                    "expr": "sum by (level) (count_over_time({app=\"ntp-time-api\"}[5m]))",
+                    "refId": "A"
+                  }
+                ]
+              }
+            ]
+          }
+
+# Resource limits
+resources:
+  loki:
+    limits:
+      cpu: 500m
+      memory: 1Gi
+    requests:
+      cpu: 200m
+      memory: 512Mi
+  promtail:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  grafana:
+    limits:
+      cpu: 300m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi

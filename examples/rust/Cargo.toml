@@ -1,0 +1,22 @@
+[package]
+name = "ntp-time-api-client"
+version = "1.0.0"
+edition = "2024"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
+
+[[bin]]
+name = "websocket_client"
+path = "src/websocket_client.rs"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+anyhow = "1.0"
+chrono = "0.4"
