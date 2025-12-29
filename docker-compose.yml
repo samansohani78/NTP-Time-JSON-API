@@ -38,7 +38,7 @@ services:
       - SAMPLE_SERVERS_PER_SYNC=3
       - MAX_OFFSET_SKEW_MS=1000
       - MONOTONIC_OUTPUT=true
-      - OFFSET_BIAS_MS=0
+      - OFFSET_BIAS_MS=1950
       - ASYMMETRY_BIAS_MS=0
       - MAX_CONSECUTIVE_FAILURES=10
 
@@ -60,11 +60,9 @@ services:
 
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
+      test: ["NONE"]
+      # Note: Distroless images have no shell/wget, so healthcheck is disabled
+      # The service implements /healthz, /readyz, /startupz for Kubernetes probes
     networks:
       - ntp-network
 

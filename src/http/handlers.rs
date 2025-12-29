@@ -4,29 +4,38 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// GET /time - Returns current NTP-derived time (zero-copy from cache)
+/// GET /time - Returns current NTP-derived time
 pub async fn time_handler(State(state): State<Arc<AppState>>) -> Response {
     let start = Instant::now();
 
     let response = match state.timebase.now_ms() {
-        Some(_epoch_ms) => {
+        Some(epoch_ms) => {
             // Determine if serving from cache
             let is_stale = state
                 .get_staleness_seconds()
                 .map(|s| s > state.config.ntp.max_staleness_secs)
                 .unwrap_or(false);
 
-            // Get pre-serialized JSON from zero-copy cache
-            let json_body = state.time_cache.get_json(is_stale);
+            // Select appropriate message based on staleness
+            let message = if is_stale {
+                &state.config.messages.ok_cache
+            } else {
+                &state.config.messages.ok
+            };
 
-            // Record cache hit
-            state.perf_metrics.record_cache_hit();
+            // Build response with calculated time
+            let body = json!({
+                "data": epoch_ms,
+                "message": message,
+                "status": 200,
+            });
 
-            // Return pre-serialized response (zero-copy - just Arc clone)
             axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from((*json_body).clone()))
+                .body(axum::body::Body::from(
+                    serde_json::to_string(&body).unwrap(),
+                ))
                 .unwrap()
         }
         None => {
