@@ -47,12 +47,12 @@ impl TimeBase {
 
     /// Update the time base with a new NTP sync result
     pub fn update(&self, sync_result: &SyncResult) {
-        let now = Instant::now();
-
         self.base_epoch_ms
             .store(sync_result.epoch_ms, Ordering::SeqCst);
 
-        *self.base_instant.write() = Some(now);
+        // CRITICAL: Use the instant from when epoch_ms was calculated, not current time
+        // This prevents timing mismatches between epoch_ms and the monotonic clock
+        *self.base_instant.write() = Some(sync_result.instant);
 
         self.has_synced.store(true, Ordering::SeqCst);
 
@@ -114,6 +114,7 @@ mod tests {
             epoch_ms,
             server: "test:123".to_string(),
             rtt: Duration::from_millis(10),
+            instant: Instant::now(),
         }
     }
 

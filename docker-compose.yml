@@ -27,7 +27,9 @@ services:
       # - LOG_FORMAT=pretty
 
       # NTP Configuration
-      - NTP_SERVERS=ntp.iranet.ir:123,ntp.day.ir:123,ir.pool.ntp.org:123,0.ir.pool.ntp.org:123,1.ir.pool.ntp.org:123,asia.pool.ntp.org:123,0.asia.pool.ntp.org:123,1.asia.pool.ntp.org:123,2.asia.pool.ntp.org:123,3.asia.pool.ntp.org:123,pool.ntp.org:123,0.pool.ntp.org:123,2.pool.ntp.org:123,time.cloudflare.com:123,time.apple.com:123
+      # NOTE: Iranian NTP servers (ntp.iranet.ir, ntp.day.ir, ir.pool.ntp.org) have clocks ~2s slow
+      # Using only accurate global servers
+      - NTP_SERVERS=time.google.com:123,time.cloudflare.com:123,time.apple.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123,time.nist.gov:123
       - NTP_TIMEOUT=2
       - SYNC_INTERVAL=30
       - PROBE_MIN_INTERVAL=5
@@ -38,7 +40,7 @@ services:
       - SAMPLE_SERVERS_PER_SYNC=3
       - MAX_OFFSET_SKEW_MS=1000
       - MONOTONIC_OUTPUT=true
-      - OFFSET_BIAS_MS=1950
+      - OFFSET_BIAS_MS=0
       - ASYMMETRY_BIAS_MS=0
       - MAX_CONSECUTIVE_FAILURES=10
 

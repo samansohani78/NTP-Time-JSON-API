@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rsntp::SntpClient;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
@@ -15,6 +15,7 @@ pub struct SyncResult {
     pub epoch_ms: i64,
     pub server: String,
     pub rtt: Duration,
+    pub instant: Instant,  // The Instant when epoch_ms was calculated
 }
 
 pub struct NtpSyncer {
@@ -147,6 +148,7 @@ impl NtpSyncer {
             epoch_ms: best.epoch_ms + self.config.offset_bias_ms,
             server: best.server,
             rtt: best.rtt,
+            instant: best.instant,
         })
     }
 
@@ -170,25 +172,49 @@ impl NtpSyncer {
         .await
         .context("NTP query timeout")??;
 
+        // CRITICAL: Capture both system time and instant IMMEDIATELY after NTP query completes
+        // These are paired together to avoid timing mismatches
+        let after_query_instant = Instant::now();
+        let after_query = std::time::SystemTime::now();
+
         let rtt = start.elapsed();
 
-        // Convert NTP timestamp to Unix epoch milliseconds
-        let ntp_seconds = result.clock_offset().as_secs_f64();
-        let system_time = SystemTime::now();
-        let unix_time = system_time
-            .duration_since(UNIX_EPOCH)
-            .context("System time before UNIX epoch")?;
+        // Get the clock offset from the NTP result
+        let offset = result.clock_offset();
+        let offset_ms = (offset.as_secs_f64() * 1000.0) as i64;
 
-        // Calculate actual NTP time
-        let ntp_time_secs = unix_time.as_secs_f64() + ntp_seconds;
-        let epoch_ms = (ntp_time_secs * 1000.0) as i64;
-        let offset_ms = (ntp_seconds * 1000.0) as i64;
+        // Apply the offset to after_query time to get NTP time
+        // This is mathematically correct: NTP_time = Local_time + offset
+        let ntp_time = if offset.signum() >= 0 {
+            after_query
+                .checked_add(
+                    offset
+                        .abs_as_std_duration()
+                        .context("Failed to convert offset to duration")?,
+                )
+                .context("Time overflow when adding offset")?
+        } else {
+            after_query
+                .checked_sub(
+                    offset
+                        .abs_as_std_duration()
+                        .context("Failed to convert offset to duration")?,
+                )
+                .context("Time underflow when subtracting offset")?
+        };
+
+        let unix_time = ntp_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("Time before UNIX epoch")?;
+
+        let epoch_ms = unix_time.as_millis() as i64;
 
         Ok(NtpResult {
             server: server.to_string(),
             epoch_ms,
             rtt,
             offset_ms,
+            instant: after_query_instant,
         })
     }
 

@@ -7,6 +7,7 @@ pub struct NtpResult {
     pub epoch_ms: i64,
     pub rtt: Duration,
     pub offset_ms: i64,
+    pub instant: std::time::Instant,
 }
 
 pub struct ServerSelector;
@@ -113,6 +114,7 @@ mod tests {
             epoch_ms: 1000000,
             rtt: Duration::from_millis(50),
             offset_ms: 100,
+            instant: std::time::Instant::now(),
         }];
 
         let best = ServerSelector::select_best_result(results, 1000);
@@ -122,24 +124,28 @@ mod tests {
 
     #[test]
     fn test_select_best_result_outlier_filtering() {
+        let now = std::time::Instant::now();
         let results = vec![
             NtpResult {
                 server: "server1:123".to_string(),
                 epoch_ms: 1000000,
                 rtt: Duration::from_millis(30),
                 offset_ms: 100,
+                instant: now,
             },
             NtpResult {
                 server: "server2:123".to_string(),
                 epoch_ms: 1000050,
                 rtt: Duration::from_millis(20),
                 offset_ms: 150,
+                instant: now,
             },
             NtpResult {
                 server: "server3:123".to_string(),
                 epoch_ms: 2000000, // Outlier
                 rtt: Duration::from_millis(10),
                 offset_ms: 10000,
+                instant: now,
             },
         ];
 
@@ -153,18 +159,21 @@ mod tests {
 
     #[test]
     fn test_select_best_result_min_rtt() {
+        let now = std::time::Instant::now();
         let results = vec![
             NtpResult {
                 server: "server1:123".to_string(),
                 epoch_ms: 1000000,
                 rtt: Duration::from_millis(50),
                 offset_ms: 100,
+                instant: now,
             },
             NtpResult {
                 server: "server2:123".to_string(),
                 epoch_ms: 1000100,
                 rtt: Duration::from_millis(20),
                 offset_ms: 110,
+                instant: now,
             },
         ];
 
