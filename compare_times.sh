@@ -2,10 +2,10 @@
 
 echo "=== Time Comparison: API vs System ==="
 echo ""
-echo "Running 5 comparisons..."
+echo "Running 9 comparisons..."
 echo ""
 
-for i in 1 2 3 4 5; do
+for i in 1 2 3 4 5 6 7 8 9; do
     api=$(curl -s http://localhost:8080/time | jq -r '.data')
     sys=$(date +%s%3N)
     diff=$((api - sys))
