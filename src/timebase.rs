@@ -1,9 +1,14 @@
 use crate::ntp::SyncResult;
 use crate::performance::TimeCache;
+use once_cell::sync::Lazy;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::debug;
+
+// Global reference instant for lock-free time calculations
+// This is created once at program startup and never changes
+static REFERENCE_INSTANT: Lazy<Instant> = Lazy::new(Instant::now);
 
 /// Monotonic time base that avoids OS wall clock authority
 /// Uses NTP-synced epoch time + monotonic clock progression
@@ -12,8 +17,9 @@ pub struct TimeBase {
     /// Base NTP epoch time in milliseconds (set on successful sync)
     base_epoch_ms: Arc<AtomicI64>,
 
-    /// Base monotonic instant (set on successful sync)
-    base_instant: Arc<parking_lot::RwLock<Option<Instant>>>,
+    /// Base monotonic instant as nanoseconds since REFERENCE_INSTANT (set on successful sync)
+    /// PERFORMANCE: Using AtomicU64 instead of RwLock eliminates all locks in read path
+    base_instant_nanos: Arc<AtomicU64>,
 
     /// Last served epoch_ms (for monotonic output clamping)
     last_served_ms: Arc<AtomicI64>,
@@ -32,7 +38,7 @@ impl TimeBase {
     pub fn new(monotonic_output: bool) -> Self {
         Self {
             base_epoch_ms: Arc::new(AtomicI64::new(0)),
-            base_instant: Arc::new(parking_lot::RwLock::new(None)),
+            base_instant_nanos: Arc::new(AtomicU64::new(0)),
             last_served_ms: Arc::new(AtomicI64::new(0)),
             monotonic_output,
             has_synced: Arc::new(AtomicBool::new(false)),
@@ -47,19 +53,22 @@ impl TimeBase {
 
     /// Update the time base with a new NTP sync result
     pub fn update(&self, sync_result: &SyncResult) {
-        self.base_epoch_ms
-            .store(sync_result.epoch_ms, Ordering::SeqCst);
-
         // CRITICAL: Use the instant from when epoch_ms was calculated, not current time
         // This prevents timing mismatches between epoch_ms and the monotonic clock
-        *self.base_instant.write() = Some(sync_result.instant);
 
-        self.has_synced.store(true, Ordering::SeqCst);
+        // Convert Instant to nanoseconds offset from REFERENCE_INSTANT for atomic storage
+        let instant_nanos = sync_result.instant
+            .duration_since(*REFERENCE_INSTANT)
+            .as_nanos() as u64;
 
-        // Update zero-copy cache if available
-        if let Some(cache) = &self.time_cache {
-            cache.update(sync_result.epoch_ms, false);
-        }
+        // PERFORMANCE: Use Release ordering - ensures all prior writes are visible
+        // before this update becomes visible to other threads
+        self.base_epoch_ms
+            .store(sync_result.epoch_ms, Ordering::Release);
+        self.base_instant_nanos
+            .store(instant_nanos, Ordering::Release);
+        self.has_synced
+            .store(true, Ordering::Release);
 
         debug!(
             base_epoch_ms = sync_result.epoch_ms,
@@ -70,29 +79,38 @@ impl TimeBase {
 
     /// Get current epoch time in milliseconds
     /// Returns None if not yet synced
+    ///
+    /// PERFORMANCE: This is the hot path - fully lock-free using atomics
     pub fn now_ms(&self) -> Option<i64> {
-        if !self.has_synced.load(Ordering::SeqCst) {
+        // PERFORMANCE: Use Acquire ordering - ensures we see all writes that happened
+        // before the Release store in update()
+        if !self.has_synced.load(Ordering::Acquire) {
             return None;
         }
 
-        let base_instant_guard = self.base_instant.read();
-        let base_instant = base_instant_guard.as_ref()?;
+        // PERFORMANCE: All atomic loads - NO LOCKS!
+        let base_instant_nanos = self.base_instant_nanos.load(Ordering::Acquire);
+        let base_epoch_ms = self.base_epoch_ms.load(Ordering::Acquire);
 
-        let base_epoch_ms = self.base_epoch_ms.load(Ordering::SeqCst);
+        // Calculate current time as nanoseconds since REFERENCE_INSTANT
+        let now_nanos = Instant::now()
+            .duration_since(*REFERENCE_INSTANT)
+            .as_nanos() as u64;
 
-        // Calculate elapsed time since base
-        let elapsed = Instant::now().duration_since(*base_instant);
-        let elapsed_ms = elapsed.as_millis() as i64;
+        // Calculate elapsed time since base instant
+        let elapsed_nanos = now_nanos.saturating_sub(base_instant_nanos);
+        let elapsed_ms = (elapsed_nanos / 1_000_000) as i64;
 
         let mut current_ms = base_epoch_ms + elapsed_ms;
 
         // Apply monotonic clamping if enabled
         if self.monotonic_output {
-            let last_served = self.last_served_ms.load(Ordering::SeqCst);
+            let last_served = self.last_served_ms.load(Ordering::Acquire);
             if current_ms <= last_served {
                 current_ms = last_served + 1;
             }
-            self.last_served_ms.store(current_ms, Ordering::SeqCst);
+            // PERFORMANCE: Release ordering ensures monotonic property is visible
+            self.last_served_ms.store(current_ms, Ordering::Release);
         }
 
         Some(current_ms)
@@ -100,7 +118,8 @@ impl TimeBase {
 
     /// Check if we've had at least one successful sync
     pub fn has_synced(&self) -> bool {
-        self.has_synced.load(Ordering::SeqCst)
+        // PERFORMANCE: Acquire ordering is sufficient here
+        self.has_synced.load(Ordering::Acquire)
     }
 }
 

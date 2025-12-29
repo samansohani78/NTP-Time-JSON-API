@@ -21,6 +21,7 @@ pub struct SyncResult {
 pub struct NtpSyncer {
     config: Arc<NtpConfig>,
     stats: Arc<RwLock<HashMap<String, ServerStats>>>,
+    current_server: Arc<RwLock<Option<String>>>,  // Sticky server selection
 }
 
 impl NtpSyncer {
@@ -33,18 +34,21 @@ impl NtpSyncer {
         Self {
             config,
             stats: Arc::new(RwLock::new(stats_map)),
+            current_server: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Perform a full sync operation using configured strategy
     pub async fn sync(&self) -> Result<SyncResult> {
-        // Query ALL servers to test them and select the best one
+        // SMART STICKY: Query ALL servers every time to find the best,
+        // but only switch if significantly better
         let all_servers: Vec<String> = self.config.servers.clone();
+        let current_server_opt = self.current_server.read().await.clone();
 
         info!(
             servers = ?all_servers,
             total_count = all_servers.len(),
-            "Testing all NTP servers"
+            "Testing all NTP servers to find best one"
         );
 
         // Query all servers in parallel
@@ -134,21 +138,80 @@ impl NtpSyncer {
         );
 
         // Select best result using outlier filtering + RTT-min
-        let best = ServerSelector::select_best_result(results, self.config.max_offset_skew_ms)
+        let best = ServerSelector::select_best_result(results.clone(), self.config.max_offset_skew_ms)
             .context("No valid NTP result after outlier filtering")?;
 
-        info!(
-            server = %best.server,
-            rtt_ms = best.rtt.as_millis(),
-            epoch_ms = best.epoch_ms,
-            "Selected best NTP server (lowest latency)"
-        );
+        // SMART STICKY: Decide whether to switch to the new best server
+        let selected_result = if let Some(current_server) = current_server_opt {
+            // We have a current server - check if we should switch
+            if let Some(current_result) = results.iter().find(|r| r.server == current_server) {
+                // Current server is still responding
+                let current_rtt_ms = current_result.rtt.as_millis();
+                let best_rtt_ms = best.rtt.as_millis();
+                let rtt_improvement = current_rtt_ms as i64 - best_rtt_ms as i64;
+
+                // Switch if new server is significantly better (50ms+ improvement)
+                // OR if current server is no longer the best by accuracy
+                if best.server == current_server {
+                    // Current server is still the best - keep using it
+                    info!(
+                        server = %current_server,
+                        rtt_ms = current_rtt_ms,
+                        "Current NTP server is still the best (sticky)"
+                    );
+                    current_result.clone()
+                } else if rtt_improvement >= 50 {
+                    // New server is significantly faster (50ms+ better)
+                    *self.current_server.write().await = Some(best.server.clone());
+                    info!(
+                        old_server = %current_server,
+                        old_rtt_ms = current_rtt_ms,
+                        new_server = %best.server,
+                        new_rtt_ms = best_rtt_ms,
+                        improvement_ms = rtt_improvement,
+                        "Switching to better NTP server (50ms+ faster)"
+                    );
+                    best
+                } else {
+                    // New server is only slightly better - keep current for consistency
+                    info!(
+                        current_server = %current_server,
+                        current_rtt_ms = current_rtt_ms,
+                        best_server = %best.server,
+                        best_rtt_ms = best_rtt_ms,
+                        rtt_diff_ms = rtt_improvement,
+                        "Keeping current NTP server (new server not significantly better)"
+                    );
+                    current_result.clone()
+                }
+            } else {
+                // Current server failed or not in results - switch to new best
+                *self.current_server.write().await = Some(best.server.clone());
+                warn!(
+                    old_server = %current_server,
+                    new_server = %best.server,
+                    new_rtt_ms = best.rtt.as_millis(),
+                    "Current NTP server failed, switching to new best server"
+                );
+                best
+            }
+        } else {
+            // No current server - select the best one
+            *self.current_server.write().await = Some(best.server.clone());
+            info!(
+                server = %best.server,
+                rtt_ms = best.rtt.as_millis(),
+                epoch_ms = best.epoch_ms,
+                "Selected initial NTP server (first sync)"
+            );
+            best
+        };
 
         Ok(SyncResult {
-            epoch_ms: best.epoch_ms + self.config.offset_bias_ms,
-            server: best.server,
-            rtt: best.rtt,
-            instant: best.instant,
+            epoch_ms: selected_result.epoch_ms + self.config.offset_bias_ms,
+            server: selected_result.server,
+            rtt: selected_result.rtt,
+            instant: selected_result.instant,
         })
     }
 

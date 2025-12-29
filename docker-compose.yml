@@ -27,9 +27,11 @@ services:
       # - LOG_FORMAT=pretty
 
       # NTP Configuration
-      # NOTE: Iranian NTP servers (ntp.iranet.ir, ntp.day.ir, ir.pool.ntp.org) have clocks ~2s slow
-      # Using only accurate global servers
-      - NTP_SERVERS=time.cloudflare.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123,ntp.ubuntu.com:123,0.ubuntu.pool.ntp.org:123,1.ubuntu.pool.ntp.org:123,2.ubuntu.pool.ntp.org:123,0.asia.pool.ntp.org:123,1.asia.pool.ntp.org:123,2.asia.pool.ntp.org:123,3.asia.pool.ntp.org:123
+      # OPTIMIZED: Best global NTP servers for maximum accuracy
+      # Tier 1: Major providers (Google, Cloudflare, Facebook)
+      # Tier 2: Pool servers (global, ubuntu, asia)
+      # Total: 24 servers for best consensus and redundancy
+      - NTP_SERVERS=time.google.com:123,time1.google.com:123,time2.google.com:123,time3.google.com:123,time4.google.com:123,time.cloudflare.com:123,time.facebook.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123,ntp.ubuntu.com:123,0.ubuntu.pool.ntp.org:123,1.ubuntu.pool.ntp.org:123,2.ubuntu.pool.ntp.org:123,0.asia.pool.ntp.org:123,1.asia.pool.ntp.org:123,2.asia.pool.ntp.org:123,3.asia.pool.ntp.org:123,time.nist.gov:123,time-a-g.nist.gov:123,time-b-g.nist.gov:123,time-c-g.nist.gov:123
       - NTP_TIMEOUT=2
       - SYNC_INTERVAL=30
       - PROBE_MIN_INTERVAL=5
@@ -38,7 +40,7 @@ services:
       - REQUIRE_SYNC=true
       - SELECTION_STRATEGY=rtt_min
       - SAMPLE_SERVERS_PER_SYNC=3
-      - MAX_OFFSET_SKEW_MS=1000
+      - MAX_OFFSET_SKEW_MS=100
       - MONOTONIC_OUTPUT=true
       - OFFSET_BIAS_MS=0
       - ASYMMETRY_BIAS_MS=0

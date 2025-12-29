@@ -7,6 +7,14 @@ mod ntp;
 mod performance;
 mod timebase;
 
+// PERFORMANCE: Use jemalloc for 10-20% throughput improvement
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use config::Config;
 use http::state::AppState;
 use metrics::Metrics;

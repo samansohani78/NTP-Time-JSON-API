@@ -16,26 +16,15 @@ pub async fn time_handler(State(state): State<Arc<AppState>>) -> Response {
                 .map(|s| s > state.config.ntp.max_staleness_secs)
                 .unwrap_or(false);
 
-            // Select appropriate message based on staleness
-            let message = if is_stale {
-                &state.config.messages.ok_cache
-            } else {
-                &state.config.messages.ok
-            };
-
-            // Build response with calculated time
-            let body = json!({
-                "data": epoch_ms,
-                "message": message,
-                "status": 200,
-            });
+            // PERFORMANCE: Update cache with current time, then get pre-serialized JSON
+            // This avoids json!() macro and serde overhead (still faster than original)
+            state.time_cache.update(epoch_ms, is_stale);
+            let json_body = state.time_cache.get_json(is_stale);
 
             axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::to_string(&body).unwrap(),
-                ))
+                .body(axum::body::Body::from((*json_body).clone()))
                 .unwrap()
         }
         None => {

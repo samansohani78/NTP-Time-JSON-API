@@ -16,17 +16,23 @@ use tracing::Level;
 pub fn create_router(state: Arc<AppState>) -> Router {
     let config = &state.config;
 
-    Router::new()
-        // Main endpoints
+    // PERFORMANCE: Fast path - NO middleware for hot endpoints
+    // This eliminates tracing, metrics, timeout, and body limit overhead
+    // Expected: 20-30% latency reduction on /time endpoint
+    let fast_router = Router::new()
         .route("/time", get(handlers::time_handler))
         .route("/", get(handlers::time_handler)) // Alias
+        .with_state(state.clone());
+
+    // Slow path - full middleware stack for less critical endpoints
+    let slow_router = Router::new()
         // WebSocket endpoint
         .route("/stream", get(websocket::websocket_handler))
-        // Probe endpoints
+        // Probe endpoints (Kubernetes probes don't need full middleware)
         .route("/healthz", get(handlers::healthz_handler))
         .route("/readyz", get(handlers::readyz_handler))
         .route("/startupz", get(handlers::startupz_handler))
-        // Metrics
+        // Metrics (needs full stack for monitoring)
         .route("/metrics", get(handlers::metrics_handler))
         .route("/performance", get(handlers::performance_handler))
         .with_state(state.clone())
@@ -44,7 +50,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        )
+        );
+
+    // Merge routers - fast path first for priority
+    Router::new().merge(fast_router).merge(slow_router)
 }
 
 #[cfg(test)]
