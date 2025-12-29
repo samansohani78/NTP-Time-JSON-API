@@ -29,7 +29,7 @@ services:
       # NTP Configuration
       # NOTE: Iranian NTP servers (ntp.iranet.ir, ntp.day.ir, ir.pool.ntp.org) have clocks ~2s slow
       # Using only accurate global servers
-      - NTP_SERVERS=time.google.com:123,time.cloudflare.com:123,time.apple.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123,time.nist.gov:123
+      - NTP_SERVERS=time.cloudflare.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123,ntp.ubuntu.com:123,0.ubuntu.pool.ntp.org:123,1.ubuntu.pool.ntp.org:123,2.ubuntu.pool.ntp.org:123,0.asia.pool.ntp.org:123,1.asia.pool.ntp.org:123,2.asia.pool.ntp.org:123,3.asia.pool.ntp.org:123
       - NTP_TIMEOUT=2
       - SYNC_INTERVAL=30
       - PROBE_MIN_INTERVAL=5
