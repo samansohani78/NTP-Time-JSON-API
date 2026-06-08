@@ -15,13 +15,13 @@ pub struct SyncResult {
     pub epoch_ms: i64,
     pub server: String,
     pub rtt: Duration,
-    pub instant: Instant,  // The Instant when epoch_ms was calculated
+    pub instant: Instant, // The Instant when epoch_ms was calculated
 }
 
 pub struct NtpSyncer {
     config: Arc<NtpConfig>,
     stats: Arc<RwLock<HashMap<String, ServerStats>>>,
-    current_server: Arc<RwLock<Option<String>>>,  // Sticky server selection
+    current_server: Arc<RwLock<Option<String>>>, // Sticky server selection
 }
 
 impl NtpSyncer {
@@ -138,8 +138,9 @@ impl NtpSyncer {
         );
 
         // Select best result using outlier filtering + RTT-min
-        let best = ServerSelector::select_best_result(results.clone(), self.config.max_offset_skew_ms)
-            .context("No valid NTP result after outlier filtering")?;
+        let best =
+            ServerSelector::select_best_result(results.clone(), self.config.max_offset_skew_ms)
+                .context("No valid NTP result after outlier filtering")?;
 
         // SMART STICKY: Decide whether to switch to the new best server
         let selected_result = if let Some(current_server) = current_server_opt {
@@ -303,7 +304,6 @@ mod tests {
             max_staleness_secs: 120,
             require_sync: true,
             selection_strategy: SelectionStrategy::RttMin,
-            sample_servers_per_sync: 3,
             max_offset_skew_ms: 1000,
             monotonic_output: true,
             offset_bias_ms: 0,

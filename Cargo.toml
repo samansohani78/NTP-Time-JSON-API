@@ -10,13 +10,10 @@ license = "MIT OR Apache-2.0"
 # HTTP server
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "timeout", "limit", "request-id", "util"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "limit", "request-id", "util", "cors"] }
+tower_governor = "0.8"
 hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-
-# gRPC (future work - tonic-build 0.14 API requires investigation)
-# tonic = "0.14"
-# prost = "0.14"
 
 # Async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
@@ -69,7 +66,3 @@ opt-level = 0
 
 [profile.test]
 opt-level = 1
-
-# [build-dependencies]
-# tonic-build = "0.14"  # Future work - API requires investigation
-# prost-build = "0.14"

@@ -6,7 +6,10 @@ pub mod websocket;
 use axum::{Router, http::StatusCode, middleware as axum_middleware, routing::get};
 use state::AppState;
 use std::sync::Arc;
+use std::time::Duration;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{
+    cors::{Any, CorsLayer},
     limit::RequestBodyLimitLayer,
     timeout::TimeoutLayer,
     trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
@@ -14,6 +17,15 @@ use tower_http::{
 use tracing::Level;
 
 pub fn create_router(state: Arc<AppState>) -> Router {
+    create_router_internal(state, true)
+}
+
+#[cfg(test)]
+pub fn create_router_for_test(state: Arc<AppState>) -> Router {
+    create_router_internal(state, false)
+}
+
+fn create_router_internal(state: Arc<AppState>, enable_rate_limiting: bool) -> Router {
     let config = &state.config;
 
     // PERFORMANCE: Fast path - NO middleware for hot endpoints
@@ -52,8 +64,31 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         );
 
-    // Merge routers - fast path first for priority
-    Router::new().merge(fast_router).merge(slow_router)
+    // CORS configuration - allow all origins for public time API
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .max_age(Duration::from_secs(3600));
+
+    let router = Router::new().merge(fast_router).merge(slow_router);
+
+    // Apply rate limiting in production only (requires real IP addresses)
+    let router = if enable_rate_limiting {
+        // Rate limiting configuration (1000 req/sec per IP, burst of 100)
+        let governor_conf = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_second(1000)
+                .burst_size(100)
+                .finish()
+                .unwrap(),
+        );
+        router.layer(GovernorLayer::new(governor_conf))
+    } else {
+        router
+    };
+
+    router.layer(cors)
 }
 
 #[cfg(test)]
@@ -85,7 +120,7 @@ mod tests {
             perf_metrics,
         ));
 
-        let app = create_router(state);
+        let app = create_router_for_test(state);
 
         // Test healthz endpoint
         let response: axum::response::Response = app

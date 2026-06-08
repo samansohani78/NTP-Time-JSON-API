@@ -7,6 +7,7 @@ use std::time::Duration;
 pub struct Config {
     pub http: HttpConfig,
     pub ntp: NtpConfig,
+    pub ntp_server: NtpServerConfig,
     pub logging: LoggingConfig,
     pub messages: MessageConfig,
 }
@@ -18,8 +19,6 @@ pub struct HttpConfig {
     pub body_limit_bytes: usize,
     pub tcp_nodelay: bool,
     pub tcp_keepalive_secs: Option<u64>,
-    pub grpc_enabled: bool,
-    pub grpc_addr: SocketAddr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +31,6 @@ pub struct NtpConfig {
     pub max_staleness_secs: u64,
     pub require_sync: bool,
     pub selection_strategy: SelectionStrategy,
-    pub sample_servers_per_sync: usize,
     pub max_offset_skew_ms: i64,
     pub monotonic_output: bool,
     pub offset_bias_ms: i64,
@@ -44,6 +42,17 @@ pub struct NtpConfig {
 #[serde(rename_all = "snake_case")]
 pub enum SelectionStrategy {
     RttMin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtpServerConfig {
+    /// Whether to listen for NTP client requests on UDP.
+    pub enabled: bool,
+    /// UDP bind address. Default `0.0.0.0:123`. Binding to ports < 1024
+    /// requires `CAP_NET_BIND_SERVICE` (or root).
+    pub addr: SocketAddr,
+    /// Maximum packet size we will accept from a client.
+    pub max_packet_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,10 +105,6 @@ impl Config {
             0 => None,
             n => Some(n),
         };
-        let grpc_enabled = env_or_parse("GRPC_ENABLED", false); // Disabled by default
-        let grpc_addr = env_or_default("GRPC_ADDR", "0.0.0.0:50051")
-            .parse()
-            .context("Failed to parse GRPC_ADDR")?;
 
         // Logging config
         let level = env_or_default("LOG_LEVEL", "info");
@@ -117,17 +122,26 @@ impl Config {
             .split(',')
             .map(|s| {
                 let s = s.trim().to_string();
-                if s.contains(':') {
+                if s.is_empty() || s.contains(':') {
                     s
                 } else {
                     format!("{}:123", s)
                 }
             })
+            .filter(|s| !s.is_empty())
             .collect();
 
         if servers.is_empty() {
             anyhow::bail!("NTP_SERVERS cannot be empty");
         }
+
+        // NTP server (responds to NTP clients on UDP) config
+        let ntp_server_enabled = env_or_parse("NTP_SERVER_ENABLED", false);
+        let ntp_server_addr = env_or_default("NTP_SERVER_ADDR", "0.0.0.0:123")
+            .parse()
+            .context("Failed to parse NTP_SERVER_ADDR")?;
+        let ntp_server_max_packet_size =
+            env_or_parse("NTP_SERVER_MAX_PACKET_SIZE", 1024usize).max(48);
 
         let timeout_secs = env_or_parse("NTP_TIMEOUT", 2);
         let sync_interval_secs = env_or_parse("SYNC_INTERVAL", 30);
@@ -144,7 +158,6 @@ impl Config {
             other => anyhow::bail!("Invalid SELECTION_STRATEGY: {}", other),
         };
 
-        let sample_servers_per_sync = env_or_parse("SAMPLE_SERVERS_PER_SYNC", 3);
         let max_offset_skew_ms = env_or_parse("MAX_OFFSET_SKEW_MS", 1000);
         let monotonic_output = env_or_parse("MONOTONIC_OUTPUT", true);
         let offset_bias_ms = env_or_parse("OFFSET_BIAS_MS", 0);
@@ -169,8 +182,6 @@ impl Config {
                 body_limit_bytes,
                 tcp_nodelay,
                 tcp_keepalive_secs,
-                grpc_enabled,
-                grpc_addr,
             },
             ntp: NtpConfig {
                 servers,
@@ -181,12 +192,16 @@ impl Config {
                 max_staleness_secs,
                 require_sync,
                 selection_strategy,
-                sample_servers_per_sync,
                 max_offset_skew_ms,
                 monotonic_output,
                 offset_bias_ms,
                 asymmetry_bias_ms,
                 max_consecutive_failures,
+            },
+            ntp_server: NtpServerConfig {
+                enabled: ntp_server_enabled,
+                addr: ntp_server_addr,
+                max_packet_size: ntp_server_max_packet_size,
             },
             logging: LoggingConfig { level, format },
             messages: MessageConfig {
@@ -213,11 +228,11 @@ impl Config {
         if self.ntp.timeout_secs < 1 {
             anyhow::bail!("NTP_TIMEOUT must be at least 1 second");
         }
-        if self.ntp.sample_servers_per_sync < 1 {
-            anyhow::bail!("SAMPLE_SERVERS_PER_SYNC must be at least 1");
-        }
         if self.ntp.probe_min_interval_secs > self.ntp.probe_max_interval_secs {
             anyhow::bail!("PROBE_MIN_INTERVAL cannot be greater than PROBE_MAX_INTERVAL");
+        }
+        if self.ntp_server.max_packet_size < 48 {
+            anyhow::bail!("NTP_SERVER_MAX_PACKET_SIZE must be at least 48");
         }
         Ok(())
     }
@@ -242,8 +257,6 @@ impl Default for Config {
                 body_limit_bytes: 1024,
                 tcp_nodelay: true,
                 tcp_keepalive_secs: Some(60),
-                grpc_enabled: false, // Disabled in tests
-                grpc_addr: "0.0.0.0:50051".parse().unwrap(),
             },
             ntp: NtpConfig {
                 servers: vec!["time.google.com:123".to_string()],
@@ -254,12 +267,16 @@ impl Default for Config {
                 max_staleness_secs: 120,
                 require_sync: true,
                 selection_strategy: SelectionStrategy::RttMin,
-                sample_servers_per_sync: 3,
                 max_offset_skew_ms: 1000,
                 monotonic_output: true,
                 offset_bias_ms: 0,
                 asymmetry_bias_ms: 0,
                 max_consecutive_failures: 10,
+            },
+            ntp_server: NtpServerConfig {
+                enabled: false,
+                addr: "0.0.0.0:123".parse().unwrap(),
+                max_packet_size: 1024,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

@@ -11,5 +11,9 @@ spec:
     targetPort: http
     protocol: TCP
     name: http
+  - port: 123
+    targetPort: ntp
+    protocol: UDP
+    name: ntp
   selector:
     app: ntp-time-api

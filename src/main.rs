@@ -1,6 +1,5 @@
 mod config;
 mod errors;
-// mod grpc_service; // Disabled - requires tonic-build API fixes
 mod http;
 mod metrics;
 mod ntp;
@@ -18,7 +17,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 use config::Config;
 use http::state::AppState;
 use metrics::Metrics;
-use ntp::NtpSyncer;
+use ntp::{NtpServer, NtpSyncer};
 use std::sync::Arc;
 use std::time::Duration;
 use timebase::TimeBase;
@@ -72,6 +71,20 @@ async fn main() -> anyhow::Result<()> {
         state.clone(),
         config.clone(),
     ));
+
+    // Start NTP server (responds to NTP clients on UDP) if enabled
+    let ntp_server_handle = if config.ntp_server.enabled {
+        let ntp_server = NtpServer::new(config.ntp_server.addr, timebase.clone(), metrics.clone())
+            .with_max_packet_size(config.ntp_server.max_packet_size);
+        Some(tokio::spawn(async move {
+            if let Err(e) = ntp_server.run().await {
+                error!(error = %e, "NTP server terminated");
+            }
+        }))
+    } else {
+        info!("NTP server disabled (NTP_SERVER_ENABLED=false)");
+        None
+    };
 
     // Create HTTP router
     let app = http::create_router(state.clone());
@@ -131,11 +144,6 @@ async fn main() -> anyhow::Result<()> {
 
     let http_server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
-    // gRPC server (disabled - requires tonic-build API fixes)
-    if config.http.grpc_enabled {
-        warn!("gRPC server requested but not available (disabled in build)");
-    }
-
     // Run HTTP server and wait for shutdown
     if let Err(e) = http_server.await {
         error!(error = %e, "HTTP server error");
@@ -143,9 +151,30 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Shutting down...");
 
-    // Cancel background tasks
+    // Give background tasks up to 5 seconds to finish on their own, then
+    // forcibly abort them. Abort is idempotent; the previous shape of
+    // this block had a buggy `tokio::select!` whose first arm always
+    // won (100 ms < 5 s), so the "force exit" arm was dead code.
+    if let Some(h) = ntp_server_handle.as_ref() {
+        h.abort();
+    }
     sync_handle.abort();
     probe_handle.abort();
+
+    if tokio::time::timeout(Duration::from_secs(5), async {
+        if let Some(h) = ntp_server_handle {
+            let _ = h.await;
+        }
+        let _ = sync_handle.await;
+        let _ = probe_handle.await;
+    })
+    .await
+    .is_err()
+    {
+        warn!("Shutdown timeout exceeded, forcing exit");
+    } else {
+        info!("Background tasks stopped gracefully");
+    }
 
     info!("Shutdown complete");
     Ok(())
@@ -260,7 +289,7 @@ async fn probe_loop(syncer: Arc<NtpSyncer>, state: Arc<AppState>, config: Arc<Co
             if let Some(rtt) = stat.last_rtt {
                 state
                     .metrics
-                    .ntp_server_rtt_seconds
+                    .ntp_server_rtt_ms
                     .get_or_create(&metrics::ServerLabel { server })
                     .set(rtt.as_millis() as i64);
             }

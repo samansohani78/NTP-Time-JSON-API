@@ -57,7 +57,8 @@ impl TimeBase {
         // This prevents timing mismatches between epoch_ms and the monotonic clock
 
         // Convert Instant to nanoseconds offset from REFERENCE_INSTANT for atomic storage
-        let instant_nanos = sync_result.instant
+        let instant_nanos = sync_result
+            .instant
             .duration_since(*REFERENCE_INSTANT)
             .as_nanos() as u64;
 
@@ -67,8 +68,7 @@ impl TimeBase {
             .store(sync_result.epoch_ms, Ordering::Release);
         self.base_instant_nanos
             .store(instant_nanos, Ordering::Release);
-        self.has_synced
-            .store(true, Ordering::Release);
+        self.has_synced.store(true, Ordering::Release);
 
         debug!(
             base_epoch_ms = sync_result.epoch_ms,
@@ -93,9 +93,7 @@ impl TimeBase {
         let base_epoch_ms = self.base_epoch_ms.load(Ordering::Acquire);
 
         // Calculate current time as nanoseconds since REFERENCE_INSTANT
-        let now_nanos = Instant::now()
-            .duration_since(*REFERENCE_INSTANT)
-            .as_nanos() as u64;
+        let now_nanos = Instant::now().duration_since(*REFERENCE_INSTANT).as_nanos() as u64;
 
         // Calculate elapsed time since base instant
         let elapsed_nanos = now_nanos.saturating_sub(base_instant_nanos);

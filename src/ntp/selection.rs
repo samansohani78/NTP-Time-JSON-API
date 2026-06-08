@@ -67,7 +67,8 @@ impl ServerSelector {
         let median_offset = offsets[offsets.len() / 2];
 
         // Calculate standard deviation for quality assessment
-        let mean_offset: f64 = offsets.iter().map(|&x| x as f64).sum::<f64>() / offsets.len() as f64;
+        let mean_offset: f64 =
+            offsets.iter().map(|&x| x as f64).sum::<f64>() / offsets.len() as f64;
         let variance: f64 = offsets
             .iter()
             .map(|&x| {
@@ -230,14 +231,14 @@ mod tests {
                 server: "server1:123".to_string(),
                 epoch_ms: 1000000,
                 rtt: Duration::from_millis(20), // Lower RTT
-                offset_ms: 50, // Further from median (100)
+                offset_ms: 50,                  // Further from median (100)
                 instant: now,
             },
             NtpResult {
                 server: "server2:123".to_string(),
                 epoch_ms: 1000100,
                 rtt: Duration::from_millis(100), // Higher RTT
-                offset_ms: 95, // Closer to median (100)
+                offset_ms: 95,                   // Closer to median (100)
                 instant: now,
             },
             NtpResult {
@@ -272,7 +273,7 @@ mod tests {
                 server: "server2:123".to_string(),
                 epoch_ms: 1000100,
                 rtt: Duration::from_millis(20), // Lower RTT
-                offset_ms: 100, // Same distance from median
+                offset_ms: 100,                 // Same distance from median
                 instant: now,
             },
         ];

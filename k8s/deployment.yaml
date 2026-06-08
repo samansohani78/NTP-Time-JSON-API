@@ -32,6 +32,9 @@ spec:
         - name: http
           containerPort: 8080
           protocol: TCP
+        - name: ntp
+          containerPort: 123
+          protocol: UDP
         env:
         - name: ADDR
           value: "0.0.0.0:8080"
@@ -62,6 +65,10 @@ spec:
           value: "5"
         - name: BODY_LIMIT_BYTES
           value: "1024"
+        - name: NTP_SERVER_ENABLED
+          value: "true"
+        - name: NTP_SERVER_ADDR
+          value: "0.0.0.0:123"
         # Persian/Farsi messages (example)
         - name: MSG_OK
           value: "done"

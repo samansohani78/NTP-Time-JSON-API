@@ -8,7 +8,7 @@ use std::time::Instant;
 pub async fn time_handler(State(state): State<Arc<AppState>>) -> Response {
     let start = Instant::now();
 
-    let response = match state.timebase.now_ms() {
+    let (response, success) = match state.timebase.now_ms() {
         Some(epoch_ms) => {
             // Determine if serving from cache
             let is_stale = state
@@ -21,11 +21,12 @@ pub async fn time_handler(State(state): State<Arc<AppState>>) -> Response {
             state.time_cache.update(epoch_ms, is_stale);
             let json_body = state.time_cache.get_json(is_stale);
 
-            axum::response::Response::builder()
+            let resp = axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from((*json_body).clone()))
-                .unwrap()
+                .unwrap();
+            (resp, true)
         }
         None => {
             // Not yet synced
@@ -37,19 +38,20 @@ pub async fn time_handler(State(state): State<Arc<AppState>>) -> Response {
                     "error": &state.config.messages.error_no_sync,
                 });
 
-                axum::response::Response::builder()
+                let resp = axum::response::Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         serde_json::to_string(&body).unwrap(),
                     ))
-                    .unwrap()
+                    .unwrap();
+                (resp, false)
             } else {
                 // If REQUIRE_SYNC is false, return system time
                 let epoch_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64;
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
 
                 let body = json!({
                     "message": &state.config.messages.ok,
@@ -57,20 +59,27 @@ pub async fn time_handler(State(state): State<Arc<AppState>>) -> Response {
                     "data": epoch_ms,
                 });
 
-                axum::response::Response::builder()
+                let resp = axum::response::Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         serde_json::to_string(&body).unwrap(),
                     ))
-                    .unwrap()
+                    .unwrap();
+                (resp, true)
             }
         }
     };
 
-    // Record latency
+    // Record latency: only count successes (2xx) as "success"; 5xx is
+    // tracked as an error so error rate / avg latency aren't polluted
+    // by the pre-sync window.
     let latency_us = start.elapsed().as_micros() as u64;
-    state.perf_metrics.record_success(latency_us);
+    if success {
+        state.perf_metrics.record_success(latency_us);
+    } else {
+        state.perf_metrics.record_error();
+    }
 
     response
 }

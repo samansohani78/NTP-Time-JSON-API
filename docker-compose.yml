@@ -6,6 +6,7 @@ services:
     container_name: ntp-time-api
     ports:
       - "8080:8080"
+      - "123:123/udp"
     environment:
       # HTTP Configuration
       - ADDR=0.0.0.0:8080
@@ -13,8 +14,6 @@ services:
       - BODY_LIMIT_BYTES=1024
       - TCP_NODELAY=true
       - TCP_KEEPALIVE_SECS=60
-      - GRPC_ENABLED=false
-      - GRPC_ADDR=0.0.0.0:50051
 
       # WebSocket Configuration
       - WS_UPDATE_INTERVAL_MS=1000
@@ -33,13 +32,15 @@ services:
       # Total: 24 servers for best consensus and redundancy
       - NTP_SERVERS=time.google.com:123,time1.google.com:123,time2.google.com:123,time3.google.com:123,time4.google.com:123,time.cloudflare.com:123,time.facebook.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123,ntp.ubuntu.com:123,0.ubuntu.pool.ntp.org:123,1.ubuntu.pool.ntp.org:123,2.ubuntu.pool.ntp.org:123,0.asia.pool.ntp.org:123,1.asia.pool.ntp.org:123,2.asia.pool.ntp.org:123,3.asia.pool.ntp.org:123,time.nist.gov:123,time-a-g.nist.gov:123,time-b-g.nist.gov:123,time-c-g.nist.gov:123
       - NTP_TIMEOUT=2
+      - NTP_SERVER_ENABLED=true
+      - NTP_SERVER_ADDR=0.0.0.0:123
+      - NTP_SERVER_MAX_PACKET_SIZE=1024
       - SYNC_INTERVAL=30
       - PROBE_MIN_INTERVAL=5
       - PROBE_MAX_INTERVAL=10
       - MAX_STALENESS=120
       - REQUIRE_SYNC=true
       - SELECTION_STRATEGY=rtt_min
-      - SAMPLE_SERVERS_PER_SYNC=3
       - MAX_OFFSET_SKEW_MS=100
       - MONOTONIC_OUTPUT=true
       - OFFSET_BIAS_MS=0

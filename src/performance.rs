@@ -13,8 +13,11 @@ pub struct TimeCache {
     json_response: Arc<ArcSwap<String>>,
     json_response_cache: Arc<ArcSwap<String>>, // For cache (stale) responses
 
-    // Last update timestamp
+    // Last update timestamp (monotonic millis since `start_instant`)
     last_update: AtomicI64,
+
+    // Anchor for the monotonic millis counter above.
+    start_instant: std::time::Instant,
 
     // Configuration
     message_ok: String,
@@ -30,35 +33,52 @@ impl TimeCache {
             json_response: Arc::new(ArcSwap::from_pointee((*initial_json).clone())),
             json_response_cache: Arc::new(ArcSwap::from_pointee((*initial_json).clone())),
             last_update: AtomicI64::new(0),
+            start_instant: std::time::Instant::now(),
             message_ok,
             message_ok_cache,
         }
     }
 
-    /// Update cache with new time (lock-free, atomic)
-    pub fn update(&self, epoch_ms: i64, _is_stale: bool) {
+    /// Update cache with new time (lock-free, atomic).
+    ///
+    /// `is_stale` picks which message (`MSG_OK` vs `MSG_OK_CACHE`) is
+    /// embedded in the response. Previously the parameter was ignored,
+    /// which meant `MSG_OK_CACHE` was never actually used in the HTTP
+    /// path.
+    pub fn update(&self, epoch_ms: i64, is_stale: bool) {
         // Store epoch
         self.epoch_ms.store(epoch_ms, Ordering::Release);
         self.last_update.store(
-            Instant::now().elapsed().as_millis() as i64,
+            // Wall-clock millis since startup, derived from the
+            // monotonic clock (Instant is the most reliable counter we
+            // have in the cache struct).
+            std::time::Instant::now()
+                .checked_duration_since(self.start_instant)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
             Ordering::Release,
         );
 
-        // Pre-serialize fresh JSON
+        // Pre-serialize the JSON for the two possible message strings.
+        // We build both every time, but they are tiny and only run on
+        // /time when the timebase is updating (not on the hot path).
         let fresh_json = format!(
             r#"{{"data":{},"message":"{}","status":200}}"#,
             epoch_ms, self.message_ok
         );
-
-        // Pre-serialize stale JSON
         let stale_json = format!(
             r#"{{"data":{},"message":"{}","status":200}}"#,
             epoch_ms, self.message_ok_cache
         );
 
         // Lock-free atomic swap
-        self.json_response.store(Arc::new(fresh_json));
-        self.json_response_cache.store(Arc::new(stale_json));
+        if is_stale {
+            self.json_response.store(Arc::new(stale_json));
+            self.json_response_cache.store(Arc::new(fresh_json));
+        } else {
+            self.json_response.store(Arc::new(fresh_json));
+            self.json_response_cache.store(Arc::new(stale_json));
+        }
     }
 
     /// Get pre-serialized JSON (zero-copy - just Arc clone)

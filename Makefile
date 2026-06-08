@@ -1,45 +1,73 @@
-.PHONY: help build test run docker-build docker-run clean fmt lint check
+.PHONY: help build test lint fmt check clean run docker-build docker-up docker-down docker-logs
 
+# Default target
 help:
 	@echo "Available targets:"
-	@echo "  build        - Build the project in release mode"
+	@echo "  build        - Build release binary"
 	@echo "  test         - Run all tests"
+	@echo "  lint         - Run clippy linter"
+	@echo "  fmt          - Format code with rustfmt"
+	@echo "  check        - Run cargo check"
+	@echo "  clean        - Clean build artifacts"
 	@echo "  run          - Run the service locally"
 	@echo "  docker-build - Build Docker image"
-	@echo "  docker-run   - Run Docker container"
-	@echo "  clean        - Clean build artifacts"
-	@echo "  fmt          - Format code"
-	@echo "  lint         - Run clippy linter"
-	@echo "  check        - Run all checks (fmt, lint, test)"
+	@echo "  docker-up    - Start service with docker-compose"
+	@echo "  docker-down  - Stop service with docker-compose"
+	@echo "  docker-logs  - View service logs"
 
+# Build release binary
 build:
 	cargo build --release
 
+# Run all tests
 test:
-	cargo test --all-features --verbose
+	cargo test --all-targets --all-features
 
-run:
-	cargo run
-
-docker-build:
-	docker build -t ntp-time-api:latest .
-
-docker-run:
-	docker run -p 8080:8080 \
-		-e LOG_FORMAT=pretty \
-		-e LOG_LEVEL=info \
-		ntp-time-api:latest
-
-clean:
-	cargo clean
-
-fmt:
-	cargo fmt --all
-
+# Run clippy linter
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 
-check: fmt lint test
-	@echo "All checks passed!"
+# Format code
+fmt:
+	cargo fmt --all
 
-.DEFAULT_GOAL := help
+# Check formatting
+fmt-check:
+	cargo fmt --all -- --check
+
+# Run cargo check
+check:
+	cargo check --all-targets
+
+# Clean build artifacts
+clean:
+	cargo clean
+	rm -rf target/
+
+# Run the service locally
+run:
+	cargo run
+
+# Build Docker image
+docker-build:
+	docker compose build
+
+# Start service with docker-compose
+docker-up:
+	docker compose up -d
+
+# Stop service with docker-compose
+docker-down:
+	docker compose down
+
+# View service logs
+docker-logs:
+	docker compose logs -f
+
+# Combined check (lint + test + format check)
+ci: fmt-check lint test
+	@echo "✓ All CI checks passed"
+
+# Quick development check
+dev-check: fmt check test
+	@echo "✓ Development checks passed"
