@@ -22,9 +22,11 @@ use super::protocol::{
 };
 use crate::metrics::Metrics;
 use crate::timebase::TimeBase;
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 
@@ -32,6 +34,72 @@ use tracing::{debug, error, info, warn};
 /// control messages can be longer; we cap defensively to avoid letting
 /// peers DoS us with jumbo datagrams.
 pub const DEFAULT_MAX_PACKET_SIZE: usize = 1024;
+
+/// Default per-IP rate limit for the UDP NTP server.
+/// Limits each source IP to this many requests per second to reduce
+/// the amplification risk from spoofed-source attacks.
+pub const DEFAULT_UDP_RATE_LIMIT: u32 = 100;
+
+/// Fixed-window per-IP rate limiter for UDP NTP requests.
+///
+/// Each source IP is allowed up to `limit_per_second` packets within
+/// any 1-second window. The window is reset when the first packet in a
+/// new second arrives. Entries older than 1 second are cleaned up lazily.
+///
+/// The mutex is only held for the duration of a hash-map lookup and
+/// increment — no I/O happens under the lock.
+struct UdpRateLimiter {
+    map: parking_lot::Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    limit_per_second: u32,
+}
+
+impl UdpRateLimiter {
+    fn new(limit_per_second: u32) -> Self {
+        Self {
+            map: parking_lot::Mutex::new(HashMap::new()),
+            limit_per_second,
+        }
+    }
+
+    /// Returns `true` if the request from `ip` should be allowed,
+    /// `false` if it exceeds the rate limit.
+    ///
+    /// `limit_per_second == 0` means unlimited — every request is allowed.
+    fn allow(&self, ip: IpAddr) -> bool {
+        if self.limit_per_second == 0 {
+            return true; // rate limiting disabled
+        }
+
+        let now = Instant::now();
+        let mut map = self.map.lock();
+
+        match map.get_mut(&ip) {
+            Some((count, window_start)) => {
+                if now.duration_since(*window_start) >= Duration::from_secs(1) {
+                    // New window — reset counter.
+                    *count = 1;
+                    *window_start = now;
+                    true
+                } else if *count < self.limit_per_second {
+                    *count += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                map.insert(ip, (1, now));
+                // Lazy cleanup: remove stale entries whenever the map grows large.
+                if map.len() > 10_000 {
+                    map.retain(|_, (_, window_start)| {
+                        now.duration_since(*window_start) < Duration::from_secs(2)
+                    });
+                }
+                true
+            }
+        }
+    }
+}
 
 /// Reference ID for a Stratum-2 server that is "local": RFC 5905 §7.3
 /// allows 4 ASCII chars (KISS codes) for Stratum >= 2.
@@ -44,15 +112,27 @@ pub struct NtpServer {
     timebase: TimeBase,
     metrics: Arc<Metrics>,
     max_packet_size: usize,
+    /// RTT of the most recent upstream NTP sync in milliseconds.
+    /// Shared from the sync loop so we can report a non-zero
+    /// `root_delay` to downstream clients (RFC 5905 §7.3).
+    last_rtt_ms: Arc<AtomicU64>,
+    rate_limiter: UdpRateLimiter,
 }
 
 impl NtpServer {
-    pub fn new(addr: SocketAddr, timebase: TimeBase, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        addr: SocketAddr,
+        timebase: TimeBase,
+        metrics: Arc<Metrics>,
+        last_rtt_ms: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             addr,
             timebase,
             metrics,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            last_rtt_ms,
+            rate_limiter: UdpRateLimiter::new(DEFAULT_UDP_RATE_LIMIT),
         }
     }
 
@@ -95,7 +175,14 @@ impl NtpServer {
     }
 
     async fn handle_request(&self, socket: &UdpSocket, peer: SocketAddr, bytes: &[u8]) {
-        self.metrics.ntp_server_requests_total.inc();
+        self.metrics.ntp_udp_server_requests_total.inc();
+
+        // Per-IP rate limiting — drop silently (no amplification response).
+        if !self.rate_limiter.allow(peer.ip()) {
+            debug!(peer = %peer, "NTP request rate-limited (dropped)");
+            self.metrics.ntp_udp_server_errors_total.inc();
+            return;
+        }
 
         let request = match parse_packet(bytes) {
             Ok(p) => p,
@@ -103,7 +190,7 @@ impl NtpServer {
                 // Short / malformed / non-client packets are normal
                 // background noise; only warn when unusual.
                 debug!(peer = %peer, error = %e, "dropping NTP packet");
-                self.metrics.ntp_server_errors_total.inc();
+                self.metrics.ntp_udp_server_errors_total.inc();
                 return;
             }
         };
@@ -111,7 +198,8 @@ impl NtpServer {
         // Capture receive timestamp as early as possible.
         let receive_ntp = unix_ms_to_ntp(self.timebase.now_ms().unwrap_or_else(system_unix_ms));
 
-        let response = build_response(&self.timebase, &request, receive_ntp);
+        let upstream_rtt_ms = self.last_rtt_ms.load(Ordering::Relaxed);
+        let response = build_response(&self.timebase, &request, receive_ntp, upstream_rtt_ms);
         let wire = serialize_packet(&response);
 
         // Capture transmit timestamp as late as possible (just before send).
@@ -121,9 +209,9 @@ impl NtpServer {
 
         match socket.send_to(&wire, peer).await {
             Ok(_) => {
-                self.metrics.ntp_server_responses_total.inc();
+                self.metrics.ntp_udp_server_responses_total.inc();
                 if !self.timebase.has_synced() {
-                    self.metrics.ntp_server_unsynced_responses_total.inc();
+                    self.metrics.ntp_udp_server_unsynced_responses_total.inc();
                 }
                 debug!(
                     peer = %peer,
@@ -134,13 +222,28 @@ impl NtpServer {
             }
             Err(e) => {
                 error!(peer = %peer, error = %e, "failed to send NTP response");
-                self.metrics.ntp_server_errors_total.inc();
+                self.metrics.ntp_udp_server_errors_total.inc();
             }
         }
     }
 }
 
-fn build_response(timebase: &TimeBase, request: &NtpPacket, receive_ntp: u64) -> NtpPacket {
+/// Convert milliseconds to NTP short format (32-bit fixed point:
+/// 16 bits seconds + 16 bits fractions of a second).
+/// `ms=0` → `0`; values ≥ 65535 ms are capped at the max short value.
+fn ms_to_ntp_short(ms: u64) -> u32 {
+    // NTP short format: seconds × 2^16 + fractions × 2^16
+    // For sub-second values: ms/1000 * 65536 = ms * 65536 / 1000
+    let ntp_units = ms.saturating_mul(65536) / 1000;
+    ntp_units.min(u32::MAX as u64) as u32
+}
+
+fn build_response(
+    timebase: &TimeBase,
+    request: &NtpPacket,
+    receive_ntp: u64,
+    upstream_rtt_ms: u64,
+) -> NtpPacket {
     let synced = timebase.has_synced();
 
     let (li, stratum) = if synced {
@@ -161,9 +264,16 @@ fn build_response(timebase: &TimeBase, request: &NtpPacket, receive_ntp: u64) ->
     // For the unsynced path, set it to 0 (RFC 5905 §7.3).
     let ref_timestamp = if synced { receive_ntp } else { 0 };
 
-    // Stratum-2 server delay/dispersion in NTP short format: 0 means
-    // "unmeasured". A real implementation would track these; we are
-    // honest and report 0.
+    // root_delay = RTT to our upstream NTP server, in NTP short format.
+    // When synced, propagate the measured RTT so downstream clients can
+    // budget their uncertainty correctly (RFC 5905 §7.3).
+    // root_dispersion is left at 0; we do not track upstream dispersion.
+    let root_delay = if synced {
+        ms_to_ntp_short(upstream_rtt_ms)
+    } else {
+        0
+    };
+
     NtpPacket {
         li,
         vn: NTP_VERSION,
@@ -177,7 +287,7 @@ fn build_response(timebase: &TimeBase, request: &NtpPacket, receive_ntp: u64) ->
         // by the sync interval and the upstream's stratum, not by
         // our local counter. 1 ms is the honest lie.
         precision: -10,
-        root_delay: 0,
+        root_delay,
         root_dispersion: 0,
         reference_id,
         ref_timestamp,
@@ -206,6 +316,7 @@ mod tests {
     use crate::metrics::Metrics;
     use crate::performance::TimeCache;
     use crate::timebase::TimeBase;
+    use std::sync::atomic::AtomicU64;
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
@@ -219,6 +330,11 @@ mod tests {
             server: "test:123".into(),
             rtt: Duration::from_millis(10),
             instant: Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
         });
         tb
     }
@@ -228,12 +344,22 @@ mod tests {
         TimeBase::new(false).with_cache(cache)
     }
 
+    fn zero_rtt() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(0))
+    }
+
     #[tokio::test]
     async fn server_responds_to_client_request() {
         let metrics = Arc::new(Metrics::new());
         let tb = synced_timebase();
-        let _server = NtpServer::new("127.0.0.1:0".parse().unwrap(), tb.clone(), metrics.clone())
-            .with_max_packet_size(128);
+        let rtt = zero_rtt();
+        let _server = NtpServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            tb.clone(),
+            metrics.clone(),
+            rtt,
+        )
+        .with_max_packet_size(128);
 
         // Bind a socket to a random port, then run the server on it.
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -242,7 +368,7 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             // Re-bind on the same port we just probed.
-            let s = NtpServer::new(addr, tb, metrics);
+            let s = NtpServer::new(addr, tb, metrics, zero_rtt());
             let _ = s.run().await;
         });
 
@@ -299,7 +425,7 @@ mod tests {
         let metrics_clone = metrics.clone();
         let tb_clone = tb.clone();
         let server_handle = tokio::spawn(async move {
-            let s = NtpServer::new(addr, tb_clone, metrics_clone);
+            let s = NtpServer::new(addr, tb_clone, metrics_clone, zero_rtt());
             let _ = s.run().await;
         });
 
@@ -328,7 +454,7 @@ mod tests {
         let tb = synced_timebase();
         let mut req = NtpPacket::new(0, 4, 3);
         req.transmit_timestamp = 0xAAAA_BBBB_CCCC_DDDD;
-        let r = build_response(&tb, &req, 0x1111_2222_3333_4444);
+        let r = build_response(&tb, &req, 0x1111_2222_3333_4444, 0);
         assert_eq!(r.li, 0);
         assert_eq!(r.stratum, 2);
         assert_eq!(r.mode, 4);
@@ -340,10 +466,81 @@ mod tests {
     fn build_response_unsynced_uses_stratum_16() {
         let tb = unsynced_timebase();
         let req = NtpPacket::new(0, 4, 3);
-        let r = build_response(&tb, &req, 0);
+        let r = build_response(&tb, &req, 0, 0);
         assert_eq!(r.li, LI_ALARM_UNSYNCHRONIZED);
         assert_eq!(r.stratum, STRATUM_UNSYNCHRONIZED);
         assert_eq!(r.reference_id, 0);
         assert_eq!(r.ref_timestamp, 0);
+    }
+
+    #[test]
+    fn build_response_synced_includes_root_delay() {
+        let tb = synced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+        // 10ms RTT → root_delay = 10 * 65536 / 1000 = 655
+        let r = build_response(&tb, &req, 0, 10);
+        assert_eq!(r.root_delay, 655);
+    }
+
+    #[test]
+    fn build_response_unsynced_root_delay_is_zero() {
+        let tb = unsynced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+        let r = build_response(&tb, &req, 0, 50);
+        assert_eq!(r.root_delay, 0, "unsynced path must always report 0");
+    }
+
+    #[test]
+    fn ms_to_ntp_short_values() {
+        assert_eq!(ms_to_ntp_short(0), 0);
+        // 10ms → 655
+        assert_eq!(ms_to_ntp_short(10), 655);
+        // 1000ms (1 sec) → 65536
+        assert_eq!(ms_to_ntp_short(1000), 65536);
+    }
+
+    // ── UdpRateLimiter tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let rl = UdpRateLimiter::new(5);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        for _ in 0..5 {
+            assert!(rl.allow(ip), "first 5 requests should be allowed");
+        }
+    }
+
+    #[test]
+    fn rate_limiter_blocks_over_limit() {
+        let rl = UdpRateLimiter::new(3);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // First 3 pass
+        for _ in 0..3 {
+            rl.allow(ip);
+        }
+        // 4th should be blocked
+        assert!(!rl.allow(ip), "4th request should be blocked");
+    }
+
+    #[test]
+    fn rate_limiter_different_ips_are_independent() {
+        let rl = UdpRateLimiter::new(1);
+        let ip1: IpAddr = "1.2.3.4".parse().unwrap();
+        let ip2: IpAddr = "5.6.7.8".parse().unwrap();
+        assert!(rl.allow(ip1));
+        // ip1 is now at limit
+        assert!(!rl.allow(ip1));
+        // ip2 is a fresh entry
+        assert!(rl.allow(ip2));
+    }
+
+    #[test]
+    fn rate_limiter_zero_limit_means_unlimited() {
+        let rl = UdpRateLimiter::new(0);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // limit=0 → disabled → all requests allowed
+        for _ in 0..100 {
+            assert!(rl.allow(ip), "limit=0 should allow everything");
+        }
     }
 }

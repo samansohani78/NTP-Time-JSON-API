@@ -6,6 +6,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct HttpLabels {
@@ -38,20 +39,18 @@ pub struct Metrics {
     pub ntp_sync_errors_total: Counter,
     pub ntp_last_sync_timestamp_seconds: Gauge,
     pub ntp_staleness_seconds: Gauge,
-    #[allow(dead_code)]
-    pub ntp_offset_seconds: Gauge,
+    pub ntp_offset_seconds: Gauge<f64, AtomicU64>,
     pub ntp_rtt_seconds: Histogram,
     pub ntp_server_up: Family<ServerLabel, Gauge>,
-    /// Misnamed historical: registered as `ntp_server_rtt_milliseconds`.
-    /// Stores the most recent RTT for each NTP *client* server, in ms.
-    pub ntp_server_rtt_ms: Family<ServerLabel, Gauge>,
+    /// Most recent RTT for each NTP *client* server, in milliseconds.
+    pub ntp_server_rtt_milliseconds: Family<ServerLabel, Gauge>,
     pub ntp_consecutive_failures: Gauge,
 
     // NTP server (responds to NTP clients on UDP) metrics
-    pub ntp_server_requests_total: Counter,
-    pub ntp_server_responses_total: Counter,
-    pub ntp_server_errors_total: Counter,
-    pub ntp_server_unsynced_responses_total: Counter,
+    pub ntp_udp_server_requests_total: Counter,
+    pub ntp_udp_server_responses_total: Counter,
+    pub ntp_udp_server_errors_total: Counter,
+    pub ntp_udp_server_unsynced_responses_total: Counter,
 
     // Build info
     #[allow(dead_code)]
@@ -118,7 +117,7 @@ impl Metrics {
             ntp_staleness_seconds.clone(),
         );
 
-        let ntp_offset_seconds = Gauge::default();
+        let ntp_offset_seconds = Gauge::<f64, AtomicU64>::default();
         registry.register(
             "ntp_offset_seconds",
             "Current NTP time offset in seconds",
@@ -141,11 +140,11 @@ impl Metrics {
             ntp_server_up.clone(),
         );
 
-        let ntp_server_rtt_ms = Family::<ServerLabel, Gauge>::default();
+        let ntp_server_rtt_milliseconds = Family::<ServerLabel, Gauge>::default();
         registry.register(
             "ntp_server_rtt_milliseconds",
             "Last RTT for each NTP *client* server in milliseconds",
-            ntp_server_rtt_ms.clone(),
+            ntp_server_rtt_milliseconds.clone(),
         );
 
         let ntp_consecutive_failures = Gauge::default();
@@ -156,32 +155,32 @@ impl Metrics {
         );
 
         // NTP server (inbound UDP) metrics
-        let ntp_server_requests_total = Counter::default();
+        let ntp_udp_server_requests_total = Counter::default();
         registry.register(
-            "ntp_server_requests_total",
-            "Total NTP server (UDP) requests received",
-            ntp_server_requests_total.clone(),
+            "ntp_udp_server_requests_total",
+            "Total UDP NTP server requests received",
+            ntp_udp_server_requests_total.clone(),
         );
 
-        let ntp_server_responses_total = Counter::default();
+        let ntp_udp_server_responses_total = Counter::default();
         registry.register(
-            "ntp_server_responses_total",
-            "Total NTP server (UDP) responses sent",
-            ntp_server_responses_total.clone(),
+            "ntp_udp_server_responses_total",
+            "Total UDP NTP server responses sent",
+            ntp_udp_server_responses_total.clone(),
         );
 
-        let ntp_server_errors_total = Counter::default();
+        let ntp_udp_server_errors_total = Counter::default();
         registry.register(
-            "ntp_server_errors_total",
-            "Total NTP server (UDP) errors (malformed, send failures)",
-            ntp_server_errors_total.clone(),
+            "ntp_udp_server_errors_total",
+            "Total UDP NTP server errors (malformed packets, send failures)",
+            ntp_udp_server_errors_total.clone(),
         );
 
-        let ntp_server_unsynced_responses_total = Counter::default();
+        let ntp_udp_server_unsynced_responses_total = Counter::default();
         registry.register(
-            "ntp_server_unsynced_responses_total",
-            "NTP server responses sent while the timebase was unsynced (LI=3, Stratum=16)",
-            ntp_server_unsynced_responses_total.clone(),
+            "ntp_udp_server_unsynced_responses_total",
+            "UDP NTP server responses sent while the timebase was unsynced (LI=3, Stratum=16)",
+            ntp_udp_server_unsynced_responses_total.clone(),
         );
 
         // Build info
@@ -207,12 +206,12 @@ impl Metrics {
             ntp_offset_seconds,
             ntp_rtt_seconds,
             ntp_server_up,
-            ntp_server_rtt_ms,
+            ntp_server_rtt_milliseconds,
             ntp_consecutive_failures,
-            ntp_server_requests_total,
-            ntp_server_responses_total,
-            ntp_server_errors_total,
-            ntp_server_unsynced_responses_total,
+            ntp_udp_server_requests_total,
+            ntp_udp_server_responses_total,
+            ntp_udp_server_errors_total,
+            ntp_udp_server_unsynced_responses_total,
             build_info,
         }
     }

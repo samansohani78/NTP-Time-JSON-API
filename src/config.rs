@@ -20,6 +20,10 @@ pub struct HttpConfig {
     pub body_limit_bytes: usize,
     pub tcp_nodelay: bool,
     pub tcp_keepalive_secs: Option<u64>,
+    /// When `true`, skip `GovernorLayer` rate limiting. Set via
+    /// `DISABLE_RATE_LIMITING=true`. Useful for local dev/smoke-testing
+    /// where no real peer IP is available to `PeerIpKeyExtractor`.
+    pub disable_rate_limiting: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,10 +43,19 @@ pub struct NtpConfig {
     pub max_consecutive_failures: u32,
 }
 
+/// NTP server selection strategy.
+///
+/// Only one strategy is currently implemented. The env-var value
+/// `"rtt_min"` is kept for backwards compatibility even though the
+/// actual algorithm is accuracy-first (closest to median offset),
+/// using RTT only as a tiebreaker.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionStrategy {
-    RttMin,
+    /// Accuracy-first: select the server closest to the consensus
+    /// (median) offset. RTT is used only as a tiebreaker. Accepted
+    /// env-var value: `"rtt_min"` (historical; preserved for compat).
+    AccuracyFirst,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +134,7 @@ impl Config {
             0 => None,
             n => Some(n),
         };
+        let disable_rate_limiting = env_or_parse("DISABLE_RATE_LIMITING", false);
 
         // Logging config
         let level = env_or_default("LOG_LEVEL", "info");
@@ -177,7 +191,7 @@ impl Config {
             .to_lowercase()
             .as_str()
         {
-            "rtt_min" => SelectionStrategy::RttMin,
+            "rtt_min" | "accuracy_first" => SelectionStrategy::AccuracyFirst,
             other => anyhow::bail!("Invalid SELECTION_STRATEGY: {}", other),
         };
 
@@ -205,6 +219,7 @@ impl Config {
                 body_limit_bytes,
                 tcp_nodelay,
                 tcp_keepalive_secs,
+                disable_rate_limiting,
             },
             ntp: NtpConfig {
                 servers,
@@ -287,6 +302,7 @@ impl Default for Config {
                 body_limit_bytes: 1024,
                 tcp_nodelay: true,
                 tcp_keepalive_secs: Some(60),
+                disable_rate_limiting: false,
             },
             ntp: NtpConfig {
                 servers: vec!["time.google.com:123".to_string()],
@@ -296,7 +312,7 @@ impl Default for Config {
                 probe_max_interval_secs: 20,
                 max_staleness_secs: 120,
                 require_sync: true,
-                selection_strategy: SelectionStrategy::RttMin,
+                selection_strategy: SelectionStrategy::AccuracyFirst,
                 max_offset_skew_ms: 1000,
                 monotonic_output: true,
                 offset_bias_ms: 0,
@@ -336,7 +352,10 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert!(!config.ntp.servers.is_empty());
-        assert_eq!(config.ntp.selection_strategy, SelectionStrategy::RttMin);
+        assert_eq!(
+            config.ntp.selection_strategy,
+            SelectionStrategy::AccuracyFirst
+        );
         assert!(config.ntp.monotonic_output);
     }
 

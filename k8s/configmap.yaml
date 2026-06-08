@@ -5,4 +5,7 @@ metadata:
   labels:
     app: ntp-time-api
 data:
-  ntp_servers: "time.google.com:123,time.cloudflare.com:123,pool.ntp.org:123"
+  # 12 well-known NTP servers for consensus accuracy. Mirror of docker-compose.yml.
+  # 3 was too few for robust outlier filtering; 12 matches the minimum recommended
+  # by RFC 5905 for stratum-2 services. Add regional servers as needed.
+  ntp_servers: "time.google.com:123,time1.google.com:123,time2.google.com:123,time3.google.com:123,time4.google.com:123,time.cloudflare.com:123,time.facebook.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123"

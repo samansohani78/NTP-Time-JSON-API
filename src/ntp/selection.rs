@@ -21,17 +21,9 @@ pub struct NtpResult {
     pub epoch_ms: i64,
     pub rtt: Duration,
     pub offset_ms: i64,
-    // T1–T4 are part of the public API but the in-tree selector
-    // doesn't consume them yet. They will be exposed via /performance
-    // and per-server metrics; for now they round-trip from
-    // query_ntp_server to a metric consumer.
-    #[allow(dead_code)]
     pub t1_client_send_ms: i64,
-    #[allow(dead_code)]
     pub t2_server_recv_ms: i64,
-    #[allow(dead_code)]
     pub t3_server_send_ms: i64,
-    #[allow(dead_code)]
     pub t4_client_recv_ms: i64,
     pub instant: std::time::Instant,
 }

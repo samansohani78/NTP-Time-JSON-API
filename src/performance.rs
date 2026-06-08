@@ -1,7 +1,6 @@
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::Instant;
 
 /// Zero-copy time cache - pre-serialized JSON responses
 /// Updates are lock-free using arc-swap
@@ -9,9 +8,11 @@ pub struct TimeCache {
     // Raw epoch milliseconds
     epoch_ms: AtomicI64,
 
-    // Pre-serialized JSON responses (zero-copy, just Arc cloning)
-    json_response: Arc<ArcSwap<String>>,
-    json_response_cache: Arc<ArcSwap<String>>, // For cache (stale) responses
+    // Pre-serialized JSON responses (zero-copy, just Arc cloning).
+    // json_fresh holds the response with MSG_OK (used when is_stale=false).
+    // json_stale holds the response with MSG_OK_CACHE (used when is_stale=true).
+    json_fresh: Arc<ArcSwap<String>>,
+    json_stale: Arc<ArcSwap<String>>,
 
     // Last update timestamp (monotonic millis since `start_instant`)
     last_update: AtomicI64,
@@ -30,8 +31,8 @@ impl TimeCache {
 
         Self {
             epoch_ms: AtomicI64::new(0),
-            json_response: Arc::new(ArcSwap::from_pointee((*initial_json).clone())),
-            json_response_cache: Arc::new(ArcSwap::from_pointee((*initial_json).clone())),
+            json_fresh: Arc::new(ArcSwap::from_pointee((*initial_json).clone())),
+            json_stale: Arc::new(ArcSwap::from_pointee((*initial_json).clone())),
             last_update: AtomicI64::new(0),
             start_instant: std::time::Instant::now(),
             message_ok,
@@ -41,11 +42,11 @@ impl TimeCache {
 
     /// Update cache with new time (lock-free, atomic).
     ///
-    /// `is_stale` picks which message (`MSG_OK` vs `MSG_OK_CACHE`) is
-    /// embedded in the response. Previously the parameter was ignored,
-    /// which meant `MSG_OK_CACHE` was never actually used in the HTTP
-    /// path.
-    pub fn update(&self, epoch_ms: i64, is_stale: bool) {
+    /// Always builds both JSON variants (fresh and stale) so that
+    /// `get_json` can serve either without any further allocation.
+    /// `is_stale` is unused here — we always store both variants so
+    /// the reader can choose based on its own staleness check.
+    pub fn update(&self, epoch_ms: i64, _is_stale: bool) {
         // Store epoch
         self.epoch_ms.store(epoch_ms, Ordering::Release);
         self.last_update.store(
@@ -59,9 +60,8 @@ impl TimeCache {
             Ordering::Release,
         );
 
-        // Pre-serialize the JSON for the two possible message strings.
-        // We build both every time, but they are tiny and only run on
-        // /time when the timebase is updating (not on the hot path).
+        // Pre-serialize both variants. They are tiny and only run during
+        // NTP sync, not on the hot /time path.
         let fresh_json = format!(
             r#"{{"data":{},"message":"{}","status":200}}"#,
             epoch_ms, self.message_ok
@@ -71,34 +71,28 @@ impl TimeCache {
             epoch_ms, self.message_ok_cache
         );
 
-        // Lock-free atomic swap
-        if is_stale {
-            self.json_response.store(Arc::new(stale_json));
-            self.json_response_cache.store(Arc::new(fresh_json));
-        } else {
-            self.json_response.store(Arc::new(fresh_json));
-            self.json_response_cache.store(Arc::new(stale_json));
-        }
+        // Lock-free atomic store — each slot always holds the correct variant.
+        self.json_fresh.store(Arc::new(fresh_json));
+        self.json_stale.store(Arc::new(stale_json));
     }
 
     /// Get pre-serialized JSON (zero-copy - just Arc clone)
     /// Returns Arc<String> which is just a pointer increment
     pub fn get_json(&self, is_stale: bool) -> Arc<String> {
         if is_stale {
-            self.json_response_cache.load_full()
+            self.json_stale.load_full()
         } else {
-            self.json_response.load_full()
+            self.json_fresh.load_full()
         }
     }
+}
 
-    /// Get raw epoch (for non-HTTP uses)
-    #[allow(dead_code)]
+#[cfg(test)]
+impl TimeCache {
     pub fn get_epoch(&self) -> i64 {
         self.epoch_ms.load(Ordering::Acquire)
     }
 
-    /// Check if cache has been initialized
-    #[allow(dead_code)]
     pub fn is_initialized(&self) -> bool {
         self.epoch_ms.load(Ordering::Acquire) > 0
     }
@@ -106,7 +100,6 @@ impl TimeCache {
 
 /// Lock-free performance metrics using atomics
 /// Zero overhead - no mutex contention
-#[allow(dead_code)]
 pub struct LockFreeMetrics {
     // Request counters
     pub total_requests: AtomicU64,
@@ -120,13 +113,8 @@ pub struct LockFreeMetrics {
 
     // Cache metrics
     pub cache_hits: AtomicU64,
-    pub cache_updates: AtomicU64,
-
-    // Start time for rate calculations
-    start_time: Instant,
 }
 
-#[allow(dead_code)]
 impl LockFreeMetrics {
     pub fn new() -> Self {
         Self {
@@ -137,8 +125,6 @@ impl LockFreeMetrics {
             min_latency_us: AtomicU64::new(u64::MAX),
             max_latency_us: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
-            cache_updates: AtomicU64::new(0),
-            start_time: Instant::now(),
         }
     }
 
@@ -166,60 +152,6 @@ impl LockFreeMetrics {
     #[inline]
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record cache update (lock-free)
-    #[inline]
-    pub fn record_cache_update(&self) {
-        self.cache_updates.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Get requests per second
-    pub fn requests_per_second(&self) -> f64 {
-        let total = self.total_requests.load(Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-
-        if elapsed > 0.0 {
-            total as f64 / elapsed
-        } else {
-            0.0
-        }
-    }
-
-    /// Get average latency in microseconds
-    pub fn avg_latency_us(&self) -> f64 {
-        let total_latency = self.total_latency_us.load(Ordering::Relaxed);
-        let success = self.success_requests.load(Ordering::Relaxed);
-
-        if success > 0 {
-            total_latency as f64 / success as f64
-        } else {
-            0.0
-        }
-    }
-
-    /// Get error rate (0.0 - 1.0)
-    pub fn error_rate(&self) -> f64 {
-        let total = self.total_requests.load(Ordering::Relaxed);
-        let errors = self.error_requests.load(Ordering::Relaxed);
-
-        if total > 0 {
-            errors as f64 / total as f64
-        } else {
-            0.0
-        }
-    }
-
-    /// Get cache hit rate (0.0 - 1.0)
-    pub fn cache_hit_rate(&self) -> f64 {
-        let total = self.total_requests.load(Ordering::Relaxed);
-        let hits = self.cache_hits.load(Ordering::Relaxed);
-
-        if total > 0 {
-            hits as f64 / total as f64
-        } else {
-            0.0
-        }
     }
 
     /// Update minimum latency (lock-free with CAS)
@@ -273,6 +205,39 @@ impl Default for LockFreeMetrics {
 }
 
 #[cfg(test)]
+impl LockFreeMetrics {
+    pub fn avg_latency_us(&self) -> f64 {
+        let total_latency = self.total_latency_us.load(Ordering::Relaxed);
+        let success = self.success_requests.load(Ordering::Relaxed);
+        if success > 0 {
+            total_latency as f64 / success as f64
+        } else {
+            0.0
+        }
+    }
+
+    pub fn error_rate(&self) -> f64 {
+        let total = self.total_requests.load(Ordering::Relaxed);
+        let errors = self.error_requests.load(Ordering::Relaxed);
+        if total > 0 {
+            errors as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+
+    pub fn cache_hit_rate(&self) -> f64 {
+        let total = self.total_requests.load(Ordering::Relaxed);
+        let hits = self.cache_hits.load(Ordering::Relaxed);
+        if total > 0 {
+            hits as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -290,6 +255,35 @@ mod tests {
         let json = cache.get_json(false);
         assert!(json.contains("1234567890000"));
         assert!(json.contains("done"));
+    }
+
+    #[test]
+    fn test_time_cache_stale_path_uses_msg_ok_cache() {
+        let cache = TimeCache::new("fresh-msg".to_string(), "stale-msg".to_string());
+        cache.update(9999999, false);
+
+        // Fresh path: should contain message_ok.
+        let fresh = cache.get_json(false);
+        assert!(fresh.contains("fresh-msg"), "fresh path must use MSG_OK");
+        assert!(
+            !fresh.contains("stale-msg"),
+            "fresh path must not use MSG_OK_CACHE"
+        );
+
+        // Stale path: should contain message_ok_cache.
+        let stale = cache.get_json(true);
+        assert!(
+            stale.contains("stale-msg"),
+            "stale path must use MSG_OK_CACHE"
+        );
+        assert!(
+            !stale.contains("fresh-msg"),
+            "stale path must not use MSG_OK"
+        );
+
+        // Both should carry the same epoch.
+        assert!(fresh.contains("9999999"));
+        assert!(stale.contains("9999999"));
     }
 
     #[test]

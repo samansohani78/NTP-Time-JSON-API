@@ -59,10 +59,11 @@ impl ServerStats {
         // Server is healthy if not disabled
         !self.disabled
     }
+}
 
-    #[allow(dead_code)]
+#[cfg(test)]
+impl ServerStats {
     pub fn is_available(&self) -> bool {
-        // Server is available if not disabled and has had at least one success
         !self.disabled && self.last_success.is_some()
     }
 }

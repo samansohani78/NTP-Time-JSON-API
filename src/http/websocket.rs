@@ -59,17 +59,7 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
     let send_task = tokio::spawn(async move {
         let mut tick = interval(Duration::from_millis(update_interval_ms));
         let mut count = 0u64;
-        // u64::MAX here means "never reach the cap" — used when
-        // max_duration_secs is 0 (unlimited). saturating_mul
-        // prevents an absurdly large max_duration_secs from
-        // overflowing the multiplication. The division is
-        // safe because Config::validate enforces
-        // update_interval_ms >= 1.
-        let max_updates = if max_duration_secs == 0 {
-            u64::MAX
-        } else {
-            max_duration_secs.saturating_mul(1000) / update_interval_ms
-        };
+        let max_updates = compute_max_updates(max_duration_secs, update_interval_ms);
 
         loop {
             tick.tick().await;
@@ -172,6 +162,19 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
     info!("WebSocket connection closed");
 }
 
+/// Compute the maximum number of tick messages to send for a connection.
+///
+/// Returns `u64::MAX` when `max_duration_secs` is 0 (unlimited).
+/// Uses saturating multiplication to defend against absurdly large values.
+/// `update_interval_ms` is guaranteed > 0 by `Config::validate`.
+fn compute_max_updates(max_duration_secs: u64, update_interval_ms: u64) -> u64 {
+    if max_duration_secs == 0 {
+        u64::MAX
+    } else {
+        max_duration_secs.saturating_mul(1000) / update_interval_ms
+    }
+}
+
 /// Format epoch milliseconds to ISO 8601 string
 fn format_epoch_ms_to_iso8601(epoch_ms: i64) -> String {
     use chrono::DateTime;
@@ -200,5 +203,35 @@ mod tests {
         assert_ne!(iso, "invalid");
         assert!(iso.contains("T")); // ISO8601 has T separator
         assert!(iso.len() > 10); // Should be full date-time
+    }
+
+    #[test]
+    fn test_compute_max_updates_unlimited() {
+        // max_duration_secs=0 means unlimited — should return u64::MAX
+        assert_eq!(compute_max_updates(0, 1000), u64::MAX);
+        assert_eq!(compute_max_updates(0, 500), u64::MAX);
+    }
+
+    #[test]
+    fn test_compute_max_updates_normal() {
+        // 60 seconds at 1000ms interval = 60 updates
+        assert_eq!(compute_max_updates(60, 1000), 60);
+        // 60 seconds at 500ms interval = 120 updates
+        assert_eq!(compute_max_updates(60, 500), 120);
+        // 3600 seconds at 1000ms = 3600 updates
+        assert_eq!(compute_max_updates(3600, 1000), 3600);
+    }
+
+    #[test]
+    fn test_compute_max_updates_truncates() {
+        // 1 second at 300ms interval = 3 (not 3.33), integer truncation
+        assert_eq!(compute_max_updates(1, 300), 3);
+    }
+
+    #[test]
+    fn test_compute_max_updates_saturating() {
+        // u64::MAX * 1000 would overflow without saturating_mul; verify it doesn't panic
+        let result = compute_max_updates(u64::MAX, 1);
+        assert_eq!(result, u64::MAX); // saturates at u64::MAX, then / 1 = u64::MAX
     }
 }

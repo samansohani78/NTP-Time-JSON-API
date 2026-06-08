@@ -23,7 +23,11 @@ pub async fn time_handler(State(state): State<Arc<AppState>>) -> Result<Response
 
     // Build the response (or error) based on timebase state.
     let result: Result<Response, AppError> = match state.timebase.now_ms() {
-        Some(epoch_ms) => Ok(build_time_response(&state, epoch_ms)),
+        Some(epoch_ms) => {
+            // Count every response served from the pre-serialized JSON cache.
+            state.perf_metrics.record_cache_hit();
+            Ok(build_time_response(&state, epoch_ms))
+        }
         None if state.config.ntp.require_sync => Err(AppError::NotSynced {
             message: state.config.messages.error.clone(),
             error: state.config.messages.error_no_sync.clone(),
@@ -180,6 +184,18 @@ pub async fn performance_handler(State(state): State<Arc<AppState>>) -> (StatusC
         0.0
     };
 
+    let ntp_timing = state.last_ntp_timing.read().clone().map(|t| {
+        json!({
+            "server": t.server,
+            "t1_client_send_ms": t.t1_client_send_ms,
+            "t2_server_recv_ms": t.t2_server_recv_ms,
+            "t3_server_send_ms": t.t3_server_send_ms,
+            "t4_client_recv_ms": t.t4_client_recv_ms,
+            "offset_ms": t.offset_ms,
+            "rtt_ms": t.rtt_ms,
+        })
+    });
+
     (
         StatusCode::OK,
         Json(json!({
@@ -207,7 +223,8 @@ pub async fn performance_handler(State(state): State<Arc<AppState>>) -> (StatusC
                 "rates": {
                     "error_rate": format!("{:.4}", error_rate),
                 },
-            }
+            },
+            "ntp_timing": ntp_timing,
         })),
     )
 }
@@ -220,15 +237,18 @@ mod tests {
     use crate::timebase::TimeBase;
 
     fn create_test_state() -> Arc<AppState> {
+        create_test_state_with_config(Arc::new(Config::default()))
+    }
+
+    fn create_test_state_with_config(config: Arc<Config>) -> Arc<AppState> {
         use crate::performance::{LockFreeMetrics, TimeCache};
 
-        let config = Arc::new(Config::default());
         let time_cache = Arc::new(TimeCache::new(
             config.messages.ok.clone(),
             config.messages.ok_cache.clone(),
         ));
         let perf_metrics = Arc::new(LockFreeMetrics::new());
-        let timebase = TimeBase::new(true).with_cache(time_cache.clone());
+        let timebase = TimeBase::new(config.ntp.require_sync).with_cache(time_cache.clone());
         let metrics = Arc::new(Metrics::new());
         Arc::new(AppState::new(
             config,
@@ -280,6 +300,47 @@ mod tests {
         let metrics_output = metrics_handler(State(state)).await;
 
         assert!(metrics_output.contains("build_info"));
+    }
+
+    /// Exercises the `REQUIRE_SYNC=false` code path where the service
+    /// returns a 200 using the OS wall clock before the first NTP sync.
+    #[tokio::test]
+    async fn test_time_require_sync_false_returns_200_before_sync() {
+        let mut config = Config::default();
+        config.ntp.require_sync = false;
+        let state = create_test_state_with_config(Arc::new(config));
+
+        // TimeBase is unsynced (no update() called).
+        assert!(!state.timebase.has_synced());
+
+        let response = time_handler(State(state))
+            .await
+            .expect("expected Ok when REQUIRE_SYNC=false");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Verifies that the system-clock fallback JSON body contains the
+    /// expected keys and a non-zero epoch.
+    #[tokio::test]
+    async fn test_time_require_sync_false_body_shape() {
+        use axum::body::to_bytes;
+
+        let mut config = Config::default();
+        config.ntp.require_sync = false;
+        let state = create_test_state_with_config(Arc::new(config));
+
+        let response = time_handler(State(state)).await.expect("expected Ok");
+
+        let bytes = to_bytes(response.into_body(), 512).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["status"], 200);
+        assert!(
+            json["data"].as_i64().unwrap_or(0) > 0,
+            "epoch_ms must be non-zero"
+        );
+        assert!(json["message"].is_string());
     }
 
     #[tokio::test]

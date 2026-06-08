@@ -132,6 +132,11 @@ mod tests {
             server: "test:123".to_string(),
             rtt: Duration::from_millis(10),
             instant: Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
         }
     }
 

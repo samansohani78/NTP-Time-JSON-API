@@ -15,7 +15,7 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 use config::Config;
-use http::state::AppState;
+use http::state::{AppState, NtpTimingSummary};
 use metrics::Metrics;
 use ntp::{NtpServer, NtpSyncer};
 use std::sync::Arc;
@@ -74,8 +74,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Start NTP server (responds to NTP clients on UDP) if enabled
     let ntp_server_handle = if config.ntp_server.enabled {
-        let ntp_server = NtpServer::new(config.ntp_server.addr, timebase.clone(), metrics.clone())
-            .with_max_packet_size(config.ntp_server.max_packet_size);
+        let ntp_server = NtpServer::new(
+            config.ntp_server.addr,
+            timebase.clone(),
+            metrics.clone(),
+            state.last_rtt_ms.clone(),
+        )
+        .with_max_packet_size(config.ntp_server.max_packet_size);
         Some(tokio::spawn(async move {
             if let Err(e) = ntp_server.run().await {
                 error!(error = %e, "NTP server terminated");
@@ -217,11 +222,29 @@ async fn sync_loop(
                     .metrics
                     .ntp_rtt_seconds
                     .observe(result.rtt.as_secs_f64());
+                state
+                    .metrics
+                    .ntp_offset_seconds
+                    .set(result.offset_ms as f64 / 1000.0);
+                state.last_rtt_ms.store(
+                    result.rtt.as_millis() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
+                *state.last_ntp_timing.write() = Some(NtpTimingSummary {
+                    server: result.server.clone(),
+                    t1_client_send_ms: result.t1_client_send_ms,
+                    t2_server_recv_ms: result.t2_server_recv_ms,
+                    t3_server_send_ms: result.t3_server_send_ms,
+                    t4_client_recv_ms: result.t4_client_recv_ms,
+                    offset_ms: result.offset_ms,
+                    rtt_ms: result.rtt.as_millis() as u64,
+                });
                 state.metrics.ntp_consecutive_failures.set(0);
 
                 info!(
                     server = %result.server,
                     rtt_ms = result.rtt.as_millis(),
+                    offset_ms = result.offset_ms,
                     "NTP sync successful"
                 );
             }
@@ -289,7 +312,7 @@ async fn probe_loop(syncer: Arc<NtpSyncer>, state: Arc<AppState>, config: Arc<Co
             if let Some(rtt) = stat.last_rtt {
                 state
                     .metrics
-                    .ntp_server_rtt_ms
+                    .ntp_server_rtt_milliseconds
                     .get_or_create(&metrics::ServerLabel { server })
                     .set(rtt.as_millis() as i64);
             }

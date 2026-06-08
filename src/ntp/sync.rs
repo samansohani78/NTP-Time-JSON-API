@@ -16,6 +16,12 @@ pub struct SyncResult {
     pub server: String,
     pub rtt: Duration,
     pub instant: Instant, // The Instant when epoch_ms was calculated
+    pub offset_ms: i64,   // Clock offset in milliseconds (positive = local behind server)
+    // RFC 5905 §8 four-tuple (unix-epoch milliseconds)
+    pub t1_client_send_ms: i64,
+    pub t2_server_recv_ms: i64,
+    pub t3_server_send_ms: i64,
+    pub t4_client_recv_ms: i64,
 }
 
 pub struct NtpSyncer {
@@ -121,73 +127,48 @@ impl NtpSyncer {
             ServerSelector::select_best_result(results.clone(), self.config.max_offset_skew_ms)
                 .context("No valid NTP result after outlier filtering")?;
 
-        // SMART STICKY: Decide whether to switch to the new best server
-        let selected_result = if let Some(current_server) = current_server_opt {
-            // We have a current server - check if we should switch
-            if let Some(current_result) = results.iter().find(|r| r.server == current_server) {
-                // Current server is still responding
-                let current_rtt_ms = current_result.rtt.as_millis();
-                let best_rtt_ms = best.rtt.as_millis();
-                // Positive = current is slower than best (improvement available).
-                // Negative = current is faster than best (no improvement).
-                let rtt_diff_ms = current_rtt_ms as i64 - best_rtt_ms as i64;
+        // SMART STICKY: Decide whether to switch to the new best server.
+        // The pure decision function is extracted for unit-testability;
+        // logging and the async sticky write happen here.
+        let (selected_result, new_sticky) = sticky_select(
+            &results,
+            best,
+            current_server_opt.as_deref(),
+            50, // switch threshold in ms
+        );
 
-                // Switch if new server is significantly better (50ms+ improvement)
-                // OR if current server is no longer the best by accuracy
-                if best.server == current_server {
-                    // Current server is still the best - keep using it
-                    info!(
-                        server = %current_server,
-                        rtt_ms = current_rtt_ms,
-                        "Current NTP server is still the best (sticky)"
-                    );
-                    current_result.clone()
-                } else if rtt_diff_ms >= 50 {
-                    // New server is significantly faster (50ms+ better)
-                    *self.current_server.write().await = Some(best.server.clone());
-                    info!(
-                        old_server = %current_server,
-                        old_rtt_ms = current_rtt_ms,
-                        new_server = %best.server,
-                        new_rtt_ms = best_rtt_ms,
-                        rtt_diff_ms = rtt_diff_ms,
-                        "Switching to better NTP server (50ms+ faster)"
-                    );
-                    best
-                } else {
-                    // New server is only slightly better - keep current for consistency
-                    info!(
-                        current_server = %current_server,
-                        current_rtt_ms = current_rtt_ms,
-                        best_server = %best.server,
-                        best_rtt_ms = best_rtt_ms,
-                        rtt_diff_ms = rtt_diff_ms,
-                        "Keeping current NTP server (new server not significantly better)"
-                    );
-                    current_result.clone()
-                }
+        if let Some(ref new_server) = new_sticky {
+            let old = current_server_opt.as_deref().unwrap_or("<none>");
+            if current_server_opt.is_none() {
+                info!(
+                    server = %new_server,
+                    rtt_ms = selected_result.rtt.as_millis(),
+                    epoch_ms = selected_result.epoch_ms,
+                    "Selected initial NTP server (first sync)"
+                );
+            } else if results.iter().any(|r| r.server.as_str() == old) {
+                info!(
+                    old_server = %old,
+                    new_server = %new_server,
+                    new_rtt_ms = selected_result.rtt.as_millis(),
+                    "Switching to better NTP server (50ms+ faster)"
+                );
             } else {
-                // Current server failed or not in results - switch to new best
-                *self.current_server.write().await = Some(best.server.clone());
                 warn!(
-                    old_server = %current_server,
-                    new_server = %best.server,
-                    new_rtt_ms = best.rtt.as_millis(),
+                    old_server = %old,
+                    new_server = %new_server,
+                    new_rtt_ms = selected_result.rtt.as_millis(),
                     "Current NTP server failed, switching to new best server"
                 );
-                best
             }
+            *self.current_server.write().await = Some(new_server.clone());
         } else {
-            // No current server - select the best one
-            *self.current_server.write().await = Some(best.server.clone());
             info!(
-                server = %best.server,
-                rtt_ms = best.rtt.as_millis(),
-                epoch_ms = best.epoch_ms,
-                "Selected initial NTP server (first sync)"
+                server = %selected_result.server,
+                rtt_ms = selected_result.rtt.as_millis(),
+                "Current NTP server is still the best (sticky)"
             );
-            best
-        };
+        }
 
         // epoch_ms already includes OFFSET_BIAS_MS and ASYMMETRY_BIAS_MS
         // (applied inside query_ntp_server). No further adjustment here.
@@ -196,6 +177,11 @@ impl NtpSyncer {
             server: selected_result.server,
             rtt: selected_result.rtt,
             instant: selected_result.instant,
+            offset_ms: selected_result.offset_ms,
+            t1_client_send_ms: selected_result.t1_client_send_ms,
+            t2_server_recv_ms: selected_result.t2_server_recv_ms,
+            t3_server_send_ms: selected_result.t3_server_send_ms,
+            t4_client_recv_ms: selected_result.t4_client_recv_ms,
         })
     }
 
@@ -338,6 +324,55 @@ impl NtpSyncer {
     }
 }
 
+/// Pure sticky-server selection algorithm.
+///
+/// Given all successful `results`, the pre-selected `best` result
+/// (output of `ServerSelector::select_best_result`), the `current_server`
+/// name (if any), and the RTT switch threshold in milliseconds, returns:
+///
+/// * `(selected, Some(new_sticky))` — use `selected`; update the sticky
+///   server to `new_sticky`.
+/// * `(selected, None)` — use `selected`; the sticky server is unchanged.
+///
+/// Three paths:
+/// 1. No current server → select `best`, update sticky.
+/// 2. Current server not in `results` (failed) → select `best`, update.
+/// 3. Current server still responding:
+///    a. It IS the best → keep it, no sticky change.
+///    b. New best is `switch_threshold_ms`+ faster → switch.
+///    c. New best is only slightly better → stay on current.
+///
+/// This function is pure (no I/O, no async) and is unit-tested directly.
+fn sticky_select(
+    results: &[NtpResult],
+    best: NtpResult,
+    current_server: Option<&str>,
+    switch_threshold_ms: i64,
+) -> (NtpResult, Option<String>) {
+    let Some(current) = current_server else {
+        let s = best.server.clone();
+        return (best, Some(s));
+    };
+
+    let Some(current_result) = results.iter().find(|r| r.server == current) else {
+        let s = best.server.clone();
+        return (best, Some(s));
+    };
+
+    if best.server == current {
+        // Current server is still the best — stay on it.
+        return (current_result.clone(), None);
+    }
+
+    let rtt_diff_ms = current_result.rtt.as_millis() as i64 - best.rtt.as_millis() as i64;
+    if rtt_diff_ms >= switch_threshold_ms {
+        let s = best.server.clone();
+        (best, Some(s))
+    } else {
+        (current_result.clone(), None)
+    }
+}
+
 /// Convert a `SystemTime` to unix-epoch milliseconds. Returns 0 if
 /// `t` is before the unix epoch (pre-1970).
 fn system_time_unix_ms(t: std::time::SystemTime) -> i64 {
@@ -381,7 +416,7 @@ mod tests {
             probe_max_interval_secs: 20,
             max_staleness_secs: 120,
             require_sync: true,
-            selection_strategy: SelectionStrategy::RttMin,
+            selection_strategy: SelectionStrategy::AccuracyFirst,
             max_offset_skew_ms: 1000,
             monotonic_output: true,
             offset_bias_ms: 0,
@@ -397,4 +432,87 @@ mod tests {
 
     // Note: Testing actual NTP queries requires network access
     // In production tests, use mock servers or integration tests
+
+    // ── sticky_select unit tests ──────────────────────────────────────────────
+
+    fn make_result(server: &str, rtt_ms: u64, offset_ms: i64) -> NtpResult {
+        NtpResult::for_testing(
+            server,
+            1_700_000_000_000,
+            Duration::from_millis(rtt_ms),
+            offset_ms,
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn sticky_select_no_current_returns_best_and_sets_sticky() {
+        let r1 = make_result("a:123", 10, 5);
+        let r2 = make_result("b:123", 20, 10);
+        let best = r1.clone();
+        let results = vec![r1, r2];
+
+        let (selected, new_sticky) = sticky_select(&results, best, None, 50);
+        assert_eq!(selected.server, "a:123");
+        assert_eq!(new_sticky.as_deref(), Some("a:123"));
+    }
+
+    #[test]
+    fn sticky_select_current_failed_switches_to_best() {
+        let r1 = make_result("a:123", 10, 5);
+        // "old:123" is NOT in results (simulates a failed server).
+        let results = vec![r1.clone()];
+
+        let (selected, new_sticky) = sticky_select(&results, r1, Some("old:123"), 50);
+        assert_eq!(selected.server, "a:123");
+        assert_eq!(new_sticky.as_deref(), Some("a:123"));
+    }
+
+    #[test]
+    fn sticky_select_current_still_best_no_switch() {
+        let r1 = make_result("a:123", 10, 5);
+        let results = vec![r1.clone()];
+        // best == current server.
+        let best = r1;
+
+        let (selected, new_sticky) = sticky_select(&results, best, Some("a:123"), 50);
+        assert_eq!(selected.server, "a:123");
+        assert!(new_sticky.is_none(), "sticky should not change");
+    }
+
+    #[test]
+    fn sticky_select_new_server_not_significantly_better_no_switch() {
+        let current = make_result("a:123", 30, 5); // current: 30ms RTT
+        let new_best = make_result("b:123", 20, 8); // best: 20ms RTT — only 10ms better
+        let results = vec![current.clone(), new_best.clone()];
+
+        let (selected, new_sticky) = sticky_select(&results, new_best, Some("a:123"), 50);
+        // rtt_diff = 30-20=10ms < 50ms threshold → keep current
+        assert_eq!(selected.server, "a:123");
+        assert!(new_sticky.is_none());
+    }
+
+    #[test]
+    fn sticky_select_new_server_significantly_better_switches() {
+        let current = make_result("a:123", 100, 5); // current: 100ms RTT
+        let new_best = make_result("b:123", 20, 8); // best: 20ms RTT — 80ms better
+        let results = vec![current.clone(), new_best.clone()];
+
+        let (selected, new_sticky) = sticky_select(&results, new_best, Some("a:123"), 50);
+        // rtt_diff = 100-20=80ms ≥ 50ms threshold → switch
+        assert_eq!(selected.server, "b:123");
+        assert_eq!(new_sticky.as_deref(), Some("b:123"));
+    }
+
+    #[test]
+    fn sticky_select_exactly_at_threshold_switches() {
+        let current = make_result("a:123", 70, 5); // current: 70ms RTT
+        let new_best = make_result("b:123", 20, 8); // best: 20ms RTT — exactly 50ms better
+        let results = vec![current.clone(), new_best.clone()];
+
+        let (selected, new_sticky) = sticky_select(&results, new_best, Some("a:123"), 50);
+        // rtt_diff = 70-20=50ms == threshold → switch (>= is inclusive)
+        assert_eq!(selected.server, "b:123");
+        assert_eq!(new_sticky.as_deref(), Some("b:123"));
+    }
 }
