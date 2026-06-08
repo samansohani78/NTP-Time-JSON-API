@@ -170,9 +170,13 @@ fn build_response(timebase: &TimeBase, request: &NtpPacket, receive_ntp: u64) ->
         mode: 4, // server
         stratum,
         poll: request.poll,
-        // Precision: 2^-20 ≈ 1 microsecond. The actual jitter is higher
-        // than this but we don't have a good signal yet.
-        precision: -20,
+        // Precision: 2^-10 ≈ 1 ms. The actual clock is read from
+        // Rust's Instant (CLOCK_MONOTONIC on Linux, ns resolution)
+        // but our time is derived from an upstream NTP sync at
+        // ~30 s intervals, so the real-world accuracy is bounded
+        // by the sync interval and the upstream's stratum, not by
+        // our local counter. 1 ms is the honest lie.
+        precision: -10,
         root_delay: 0,
         root_dispersion: 0,
         reference_id,

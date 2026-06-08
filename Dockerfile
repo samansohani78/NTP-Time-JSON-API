@@ -27,8 +27,11 @@ FROM gcr.io/distroless/cc-debian13:nonroot
 # Copy binary from builder (distroless uses / as workdir)
 COPY --from=builder /app/target/release/ntp-time-json-api /ntp-time-json-api
 
-# Expose HTTP port
+# Expose HTTP and NTP ports
+# 8080/tcp — JSON API + Prometheus metrics + WebSocket stream
+# 123/udp  — NTP server (RFC 5905) when NTP_SERVER_ENABLED=true
 EXPOSE 8080
+EXPOSE 123/udp
 
 # Run as non-root user (distroless nonroot = UID 65532, no shell available)
 ENTRYPOINT ["/ntp-time-json-api"]

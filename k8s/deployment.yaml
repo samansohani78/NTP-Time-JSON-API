@@ -57,8 +57,6 @@ spec:
           value: "true"
         - name: MONOTONIC_OUTPUT
           value: "true"
-        - name: SAMPLE_SERVERS_PER_SYNC
-          value: "3"
         - name: MAX_OFFSET_SKEW_MS
           value: "1000"
         - name: REQUEST_TIMEOUT
