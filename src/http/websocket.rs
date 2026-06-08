@@ -27,23 +27,13 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
     // Client info
     info!("WebSocket client connected");
 
-    // Configuration
-    // WS_UPDATE_INTERVAL_MS=0 is treated as "unset" (fall back to
-    // default); a 0 interval would cause a divide-by-zero in
-    // max_updates below. The fallback default is 1s.
-    let update_interval_ms = std::env::var("WS_UPDATE_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .unwrap_or(1000);
-
-    // WS_MAX_DURATION_SECS=0 means "unlimited" (no auto-close). Any
-    // other value caps the connection length. saturating_mul protects
-    // against absurdly large values overflowing u64.
-    let max_duration_secs: u64 = std::env::var("WS_MAX_DURATION_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3600); // Default: 1 hour
+    // Read the WS config once (it was populated at startup from
+    // the WS_UPDATE_INTERVAL_MS / WS_MAX_DURATION_SECS env vars
+    // and validated in Config::from_env). Re-reading std::env on
+    // every connection would defeat rolling deploys and waste
+    // a few microseconds per handshake.
+    let update_interval_ms = state.config.ws.update_interval_ms;
+    let max_duration_secs = state.config.ws.max_duration_secs;
 
     // Send welcome message
     let welcome = json!({
@@ -72,7 +62,9 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
         // u64::MAX here means "never reach the cap" — used when
         // max_duration_secs is 0 (unlimited). saturating_mul
         // prevents an absurdly large max_duration_secs from
-        // overflowing the multiplication.
+        // overflowing the multiplication. The division is
+        // safe because Config::validate enforces
+        // update_interval_ms >= 1.
         let max_updates = if max_duration_secs == 0 {
             u64::MAX
         } else {

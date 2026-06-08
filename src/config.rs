@@ -8,6 +8,7 @@ pub struct Config {
     pub http: HttpConfig,
     pub ntp: NtpConfig,
     pub ntp_server: NtpServerConfig,
+    pub ws: WsConfig,
     pub logging: LoggingConfig,
     pub messages: MessageConfig,
 }
@@ -53,6 +54,21 @@ pub struct NtpServerConfig {
     pub addr: SocketAddr,
     /// Maximum packet size we will accept from a client.
     pub max_packet_size: usize,
+}
+
+/// WebSocket configuration. Read once at startup; the per-connection
+/// handler reads from `AppState` rather than re-hitting `std::env`.
+///
+/// * `update_interval_ms` — milliseconds between time updates sent to
+///   each connected client. `0` is treated as "unset" and falls back
+///   to the default (1000 ms). Must be > 0 at runtime.
+/// * `max_duration_secs` — maximum connection length before the
+///   server auto-closes. `0` is "unlimited" (no cap). The
+///   `validate()` method enforces sane bounds.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WsConfig {
+    pub update_interval_ms: u64,
+    pub max_duration_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +159,13 @@ impl Config {
         let ntp_server_max_packet_size =
             env_or_parse("NTP_SERVER_MAX_PACKET_SIZE", 1024usize).max(48);
 
+        // WebSocket config. 0 / unparseable falls back to the default.
+        // We apply the .filter(|&ms| ms > 0) guard here so the
+        // per-connection handler doesn't have to re-do the validation
+        // and divide-by-zero in the max_updates calculation.
+        let ws_update_interval_ms = env_or_parse("WS_UPDATE_INTERVAL_MS", 1000u64).max(1);
+        let ws_max_duration_secs = env_or_parse("WS_MAX_DURATION_SECS", 3600u64);
+
         let timeout_secs = env_or_parse("NTP_TIMEOUT", 2);
         let sync_interval_secs = env_or_parse("SYNC_INTERVAL", 30);
         let probe_min_interval_secs = env_or_parse("PROBE_MIN_INTERVAL", 10);
@@ -203,6 +226,10 @@ impl Config {
                 addr: ntp_server_addr,
                 max_packet_size: ntp_server_max_packet_size,
             },
+            ws: WsConfig {
+                update_interval_ms: ws_update_interval_ms,
+                max_duration_secs: ws_max_duration_secs,
+            },
             logging: LoggingConfig { level, format },
             messages: MessageConfig {
                 ok,
@@ -233,6 +260,9 @@ impl Config {
         }
         if self.ntp_server.max_packet_size < 48 {
             anyhow::bail!("NTP_SERVER_MAX_PACKET_SIZE must be at least 48");
+        }
+        if self.ws.update_interval_ms == 0 {
+            anyhow::bail!("WS_UPDATE_INTERVAL_MS must be at least 1 ms");
         }
         Ok(())
     }
@@ -278,6 +308,10 @@ impl Default for Config {
                 addr: "0.0.0.0:123".parse().unwrap(),
                 max_packet_size: 1024,
             },
+            ws: WsConfig {
+                update_interval_ms: 1000,
+                max_duration_secs: 3600,
+            },
             logging: LoggingConfig {
                 level: "info".to_string(),
                 format: LogFormat::Json,
@@ -321,6 +355,13 @@ mod tests {
         // Invalid probe intervals
         config.ntp.probe_min_interval_secs = 100;
         config.ntp.probe_max_interval_secs = 10;
+        assert!(config.validate().is_err());
+
+        // WS update interval of 0 should fail (would cause
+        // divide-by-zero in the per-connection max_updates calc).
+        config.ntp.probe_min_interval_secs = 10;
+        config.ntp.probe_max_interval_secs = 20;
+        config.ws.update_interval_ms = 0;
         assert!(config.validate().is_err());
     }
 
