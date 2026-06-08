@@ -112,6 +112,15 @@ spec:
           runAsUser: 1000
           capabilities:
             drop:
+            # Drop every Linux capability...
             - ALL
+            # ...then re-add only the one we need: NET_BIND_SERVICE
+            # so the NTP server (when NTP_SERVER_ENABLED=true) can
+            # bind UDP port 123. NTP_SERVER_ADDR in this deployment
+            # defaults to 0.0.0.0:123; if you change it to a port
+            # >= 1024 you can remove the NET_BIND_SERVICE add below
+            # and rely on the dropped-all set alone.
+            add:
+            - NET_BIND_SERVICE
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
