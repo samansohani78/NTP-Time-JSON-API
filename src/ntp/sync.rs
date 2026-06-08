@@ -56,8 +56,13 @@ impl NtpSyncer {
         for server in all_servers {
             let server_clone = server.clone();
             let timeout_duration = Duration::from_secs(self.config.timeout_secs);
+            // Biases are captured per task so query_ntp_server can
+            // apply them without needing &self.
+            let offset_bias = self.config.offset_bias_ms;
+            let asymmetry_bias = self.config.asymmetry_bias_ms;
             let task = tokio::spawn(async move {
-                Self::query_ntp_server(&server_clone, timeout_duration).await
+                Self::query_ntp_server(&server_clone, timeout_duration, offset_bias, asymmetry_bias)
+                    .await
             });
             query_tasks.push((server, task));
         }
@@ -184,17 +189,50 @@ impl NtpSyncer {
             best
         };
 
+        // epoch_ms already includes OFFSET_BIAS_MS and ASYMMETRY_BIAS_MS
+        // (applied inside query_ntp_server). No further adjustment here.
         Ok(SyncResult {
-            epoch_ms: selected_result.epoch_ms + self.config.offset_bias_ms,
+            epoch_ms: selected_result.epoch_ms,
             server: selected_result.server,
             rtt: selected_result.rtt,
             instant: selected_result.instant,
         })
     }
 
-    /// Query a single NTP server
-    async fn query_ntp_server(server: &str, timeout_duration: Duration) -> Result<NtpResult> {
+    /// Query a single NTP server.
+    ///
+    /// Captures the RFC 5905 §8 four-tuple (T1, T2, T3, T4):
+    /// * T1 — client transmit (SystemTime captured just before the
+    ///   blocking call enters spawn_blocking)
+    /// * T2 — server receive (derived: T1 + offset + delay/2)
+    /// * T3 — server transmit (derived: T4 - offset + delay/2)
+    /// * T4 — client receive (SystemTime captured immediately after
+    ///   the blocking call returns)
+    ///
+    /// `epoch_ms` is the corrected unix-epoch at T4, i.e. `T4 + θ`.
+    /// T2 and T3 are derived from T1, T4, θ (offset), and δ (delay)
+    /// because the upstream `rsntp` library does not expose the raw
+    /// server-side timestamps. The derivations are exact (modulo
+    /// float→i64 rounding of θ/δ):
+    ///
+    /// ```text
+    ///   θ = ((T2 - T1) + (T3 - T4)) / 2
+    ///   δ =  (T4 - T1) - (T3 - T2)
+    ///   T2 = T1 + θ + δ/2
+    ///   T3 = T4 - θ + δ/2
+    /// ```
+    async fn query_ntp_server(
+        server: &str,
+        timeout_duration: Duration,
+        offset_bias_ms: i64,
+        asymmetry_bias_ms: i64,
+    ) -> Result<NtpResult> {
+        // T1 in two clocks: the Instant pair is used to compute RTT
+        // (immune to wall-clock skew); the SystemTime pair participates
+        // in the RFC 5905 four-tuple.
         let start = Instant::now();
+        let t1_system = std::time::SystemTime::now();
+        let t1_unix_ms = system_time_unix_ms(t1_system);
 
         // Parse server address
         let addr = server.to_string();
@@ -215,45 +253,59 @@ impl NtpSyncer {
         // CRITICAL: Capture both system time and instant IMMEDIATELY after NTP query completes
         // These are paired together to avoid timing mismatches
         let after_query_instant = Instant::now();
-        let after_query = std::time::SystemTime::now();
+        let t4_system = std::time::SystemTime::now();
+        let t4_unix_ms = system_time_unix_ms(t4_system);
 
         let rtt = start.elapsed();
 
-        // Get the clock offset from the NTP result
+        // θ = server-reported clock offset (signed: positive = local
+        // is behind server, negative = local is ahead of server)
         let offset = result.clock_offset();
         let offset_ms = (offset.as_secs_f64() * 1000.0) as i64;
 
-        // Apply the offset to after_query time to get NTP time
-        // This is mathematically correct: NTP_time = Local_time + offset
-        let ntp_time = if offset.signum() >= 0 {
-            after_query
-                .checked_add(
-                    offset
-                        .abs_as_std_duration()
-                        .context("Failed to convert offset to duration")?,
-                )
-                .context("Time overflow when adding offset")?
-        } else {
-            after_query
-                .checked_sub(
-                    offset
-                        .abs_as_std_duration()
-                        .context("Failed to convert offset to duration")?,
-                )
-                .context("Time underflow when subtracting offset")?
-        };
+        // δ = server-reported round-trip delay
+        let delay_ms = (result.round_trip_delay().as_secs_f64() * 1000.0) as i64;
+
+        // Derive T2 and T3 from T1, T4, θ, δ. Solving the
+        // RFC 5905 §8 linear system:
+        //   θ = ((T2 - T1) + (T3 - T4)) / 2
+        //   δ =  (T4 - T1) - (T3 - T2)
+        // yields:
+        //   T2 = T1 + θ + δ/2
+        //   T3 = T4 + θ - δ/2
+        // Both are saturating additions to defend against i64 overflow
+        // on inputs with extreme values.
+        let half_delay_ms = delay_ms / 2;
+        let t2_unix_ms = t1_unix_ms
+            .saturating_add(offset_ms)
+            .saturating_add(half_delay_ms);
+        let t3_unix_ms = t4_unix_ms
+            .saturating_add(offset_ms)
+            .saturating_sub(half_delay_ms);
+
+        // corrected_time = T4 + θ. Apply the user-configured
+        // OFFSET_BIAS_MS and ASYMMETRY_BIAS_MS on top.
+        // ASYMMETRY_BIAS_MS is a manual compensation for network
+        // paths that are known to be asymmetric; the algorithm
+        // itself is already the optimal symmetric correction.
+        let ntp_time = apply_offset_to_systemtime(t4_system, offset)
+            .context("Failed to apply offset to T4")?;
 
         let unix_time = ntp_time
             .duration_since(std::time::UNIX_EPOCH)
             .context("Time before UNIX epoch")?;
 
-        let epoch_ms = unix_time.as_millis() as i64;
+        let epoch_ms = unix_time.as_millis() as i64 + offset_bias_ms + asymmetry_bias_ms;
 
         Ok(NtpResult {
             server: server.to_string(),
             epoch_ms,
             rtt,
             offset_ms,
+            t1_client_send_ms: t1_unix_ms,
+            t2_server_recv_ms: t2_unix_ms,
+            t3_server_send_ms: t3_unix_ms,
+            t4_client_recv_ms: t4_unix_ms,
             instant: after_query_instant,
         })
     }
@@ -283,6 +335,34 @@ impl NtpSyncer {
                 );
             }
         }
+    }
+}
+
+/// Convert a `SystemTime` to unix-epoch milliseconds. Returns 0 if
+/// `t` is before the unix epoch (pre-1970).
+fn system_time_unix_ms(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Apply a signed rsntp `SntpDuration` offset to a `SystemTime`,
+/// returning the corrected time. Sign convention matches rsntp:
+/// positive offset means "add this much to local time to get server
+/// time".
+fn apply_offset_to_systemtime(
+    base: std::time::SystemTime,
+    offset: rsntp::SntpDuration,
+) -> Result<std::time::SystemTime> {
+    let abs = offset
+        .abs_as_std_duration()
+        .context("Failed to convert offset to duration")?;
+    if offset.signum() >= 0 {
+        base.checked_add(abs)
+            .context("Time overflow when adding offset")
+    } else {
+        base.checked_sub(abs)
+            .context("Time underflow when subtracting offset")
     }
 }
 

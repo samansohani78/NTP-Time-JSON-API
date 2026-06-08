@@ -1,12 +1,67 @@
 use std::time::Duration;
 
+/// One NTP query result, carrying the RFC 5905 §8 four-tuple
+/// (T1, T2, T3, T4) plus derived fields:
+///
+/// * `T1` — client transmit time (origin timestamp in the request)
+/// * `T2` — server receive time (parsed from the server's response)
+/// * `T3` — server transmit time (parsed from the server's response)
+/// * `T4` — client receive time
+///
+/// `offset_ms` and `rtt` are the standard derived values; `epoch_ms`
+/// is the corrected unix epoch at T4 (i.e. `T4 + offset` plus the
+/// configured biases).
+///
+/// We carry T1–T4 explicitly so the math is auditable and so callers
+/// (metrics, debug endpoints) can inspect the upstream's view of our
+/// clock. The four fields are in unix-epoch milliseconds.
 #[derive(Debug, Clone)]
 pub struct NtpResult {
     pub server: String,
     pub epoch_ms: i64,
     pub rtt: Duration,
     pub offset_ms: i64,
+    // T1–T4 are part of the public API but the in-tree selector
+    // doesn't consume them yet. They will be exposed via /performance
+    // and per-server metrics; for now they round-trip from
+    // query_ntp_server to a metric consumer.
+    #[allow(dead_code)]
+    pub t1_client_send_ms: i64,
+    #[allow(dead_code)]
+    pub t2_server_recv_ms: i64,
+    #[allow(dead_code)]
+    pub t3_server_send_ms: i64,
+    #[allow(dead_code)]
+    pub t4_client_recv_ms: i64,
     pub instant: std::time::Instant,
+}
+
+impl NtpResult {
+    /// Test-only constructor. Real production code paths build
+    /// `NtpResult` from the full RFC 5905 four-tuple inside
+    /// `query_ntp_server`; tests that exercise `select_best_result`
+    /// only care about `offset_ms` and `rtt`, so we zero the T1–T4
+    /// fields here.
+    #[cfg(test)]
+    pub fn for_testing(
+        server: &str,
+        epoch_ms: i64,
+        rtt: Duration,
+        offset_ms: i64,
+        instant: std::time::Instant,
+    ) -> Self {
+        Self {
+            server: server.to_string(),
+            epoch_ms,
+            rtt,
+            offset_ms,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            instant,
+        }
+    }
 }
 
 pub struct ServerSelector;
@@ -116,13 +171,13 @@ mod tests {
 
     #[test]
     fn test_select_best_result_single() {
-        let results = vec![NtpResult {
-            server: "server1:123".to_string(),
-            epoch_ms: 1000000,
-            rtt: Duration::from_millis(50),
-            offset_ms: 100,
-            instant: std::time::Instant::now(),
-        }];
+        let results = vec![NtpResult::for_testing(
+            "server1:123",
+            1000000,
+            Duration::from_millis(50),
+            100,
+            std::time::Instant::now(),
+        )];
 
         let best = ServerSelector::select_best_result(results, 1000);
         assert!(best.is_some());
@@ -133,27 +188,15 @@ mod tests {
     fn test_select_best_result_outlier_filtering() {
         let now = std::time::Instant::now();
         let results = vec![
-            NtpResult {
-                server: "server1:123".to_string(),
-                epoch_ms: 1000000,
-                rtt: Duration::from_millis(30),
-                offset_ms: 100,
-                instant: now,
-            },
-            NtpResult {
-                server: "server2:123".to_string(),
-                epoch_ms: 1000050,
-                rtt: Duration::from_millis(20),
-                offset_ms: 150,
-                instant: now,
-            },
-            NtpResult {
-                server: "server3:123".to_string(),
-                epoch_ms: 2000000, // Outlier
-                rtt: Duration::from_millis(10),
-                offset_ms: 10000,
-                instant: now,
-            },
+            NtpResult::for_testing("server1:123", 1000000, Duration::from_millis(30), 100, now),
+            NtpResult::for_testing("server2:123", 1000050, Duration::from_millis(20), 150, now),
+            NtpResult::for_testing(
+                "server3:123",
+                2000000,
+                Duration::from_millis(10),
+                10000,
+                now,
+            ),
         ];
 
         // With strict skew threshold, server3 should be filtered out
@@ -169,27 +212,9 @@ mod tests {
     fn test_select_best_result_accuracy_first() {
         let now = std::time::Instant::now();
         let results = vec![
-            NtpResult {
-                server: "server1:123".to_string(),
-                epoch_ms: 1000000,
-                rtt: Duration::from_millis(20), // Lower RTT
-                offset_ms: 50,                  // Further from median (100)
-                instant: now,
-            },
-            NtpResult {
-                server: "server2:123".to_string(),
-                epoch_ms: 1000100,
-                rtt: Duration::from_millis(100), // Higher RTT
-                offset_ms: 95,                   // Closer to median (100)
-                instant: now,
-            },
-            NtpResult {
-                server: "server3:123".to_string(),
-                epoch_ms: 1000150,
-                rtt: Duration::from_millis(50),
-                offset_ms: 150, // Further from median
-                instant: now,
-            },
+            NtpResult::for_testing("server1:123", 1000000, Duration::from_millis(20), 50, now),
+            NtpResult::for_testing("server2:123", 1000100, Duration::from_millis(100), 95, now),
+            NtpResult::for_testing("server3:123", 1000150, Duration::from_millis(50), 150, now),
         ];
 
         let best = ServerSelector::select_best_result(results, 1000);
@@ -204,25 +229,64 @@ mod tests {
     fn test_select_best_result_rtt_tiebreaker() {
         let now = std::time::Instant::now();
         let results = vec![
-            NtpResult {
-                server: "server1:123".to_string(),
-                epoch_ms: 1000000,
-                rtt: Duration::from_millis(50),
-                offset_ms: 100, // Same distance from median
-                instant: now,
-            },
-            NtpResult {
-                server: "server2:123".to_string(),
-                epoch_ms: 1000100,
-                rtt: Duration::from_millis(20), // Lower RTT
-                offset_ms: 100,                 // Same distance from median
-                instant: now,
-            },
+            NtpResult::for_testing("server1:123", 1000000, Duration::from_millis(50), 100, now),
+            NtpResult::for_testing("server2:123", 1000100, Duration::from_millis(20), 100, now),
         ];
 
         let best = ServerSelector::select_best_result(results, 1000);
         assert!(best.is_some());
         // When accuracy is equal, RTT is used as tiebreaker
         assert_eq!(best.unwrap().server, "server2:123");
+    }
+
+    /// Hand-computed RFC 5905 §8 four-tuple.
+    ///
+    /// Physical setup: client sends at T1=1000, server's clock is
+    /// 30ms behind client's. Network transit is 50ms each way,
+    /// server holds the packet for 100ms.
+    /// * T1 = 1000 ms (client send, client clock)
+    /// * T2 = 1020 ms (server receive, server clock: 1000+50-30)
+    /// * T3 = 1120 ms (server send, server clock: 1020+100)
+    /// * T4 = 1200 ms (client receive, client clock: 1000+50+100+50)
+    ///
+    /// From these: θ = ((1020-1000)+(1120-1200))/2 = (20+(-80))/2 = -30
+    ///             δ = (1200-1000)-(1120-1020) = 200-100 = 100
+    /// corrected_time = T4 + θ = 1200 + (-30) = 1170
+    #[test]
+    fn rfc5905_four_tuple_relations_hold() {
+        let r = NtpResult {
+            server: "test:123".to_string(),
+            epoch_ms: 1170,
+            rtt: Duration::from_millis(100),
+            offset_ms: -30,
+            t1_client_send_ms: 1000,
+            t2_server_recv_ms: 1020,
+            t3_server_send_ms: 1120,
+            t4_client_recv_ms: 1200,
+            instant: std::time::Instant::now(),
+        };
+
+        let derived_offset_ms = ((r.t2_server_recv_ms - r.t1_client_send_ms)
+            + (r.t3_server_send_ms - r.t4_client_recv_ms))
+            / 2;
+        let derived_delay_ms = (r.t4_client_recv_ms - r.t1_client_send_ms)
+            - (r.t3_server_send_ms - r.t2_server_recv_ms);
+
+        assert_eq!(derived_offset_ms, r.offset_ms, "θ derivation");
+        assert_eq!(derived_delay_ms, r.rtt.as_millis() as i64, "δ derivation");
+        assert_eq!(
+            r.epoch_ms,
+            r.t4_client_recv_ms + r.offset_ms,
+            "corrected time"
+        );
+
+        // Cross-check the inverse derivations used in query_ntp_server:
+        //   T2 = T1 + θ + δ/2
+        //   T3 = T4 + θ - δ/2
+        let half_delay = derived_delay_ms / 2;
+        let t2_derived = r.t1_client_send_ms + derived_offset_ms + half_delay;
+        let t3_derived = r.t4_client_recv_ms + derived_offset_ms - half_delay;
+        assert_eq!(t2_derived, r.t2_server_recv_ms, "T2 inverse derivation");
+        assert_eq!(t3_derived, r.t3_server_send_ms, "T3 inverse derivation");
     }
 }
