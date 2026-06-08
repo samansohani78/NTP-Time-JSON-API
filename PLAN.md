@@ -1195,9 +1195,10 @@ intentional and correct, but document it.
 The following items are ordered by **value-to-risk ratio**.
 Each item is small and self-contained.
 
-> **Status (as of wave 6 of 6):** the items marked **[done]** in
-> §26.1, §26.2, and §26.3 are landed on `main`. The open items
-> are in §26.4 and §26.5.
+> **Status (as of wave 9 of 9):** all 23 findings in
+> §26.1, §26.2, §26.3, and §26.4 are closed. §26.5 is
+> the empty "no further work" placeholder. See §29 for
+> the per-wave changelog.
 
 ### 26.1 P0 — correctness (must fix)
 - [done] **B1**: Fix broken shutdown `select!` in `main.rs`.
@@ -1287,21 +1288,15 @@ Each item is small and self-contained.
 - Promote `AppState` field names to private (use getters
   where appropriate) to make future refactors safer.
 
-### 26.5 Deferred beyond waves 1–6
+### 26.5 Deferred (now empty)
 
-These were intentionally not addressed in this round.
-Each is its own focused PR.
+All 23 findings catalogued in §26 are resolved. This
+section is kept for the moment so future diffs can be
+anchored to it; if the next audit adds a new item, it
+can go here with the same format.
 
-- **B7** — WebSocket env-var reads still happen per
-  connection. Lifting to startup needs `AppState` to
-  carry a `WsConfig` struct, plus updates to `Config`,
-  `AppState::new`, and `websocket::websocket_connection`.
-- **B16** — `GIT_SHA` build arg is still not set in CI.
-  Independent concern from the rest; needs a one-line
-  change in `.github/workflows/ci.yml`.
-- **B18** — `NET_BIND_SERVICE` capability. Operator
-  policy decision; needs explicit sign-off before
-  changing the k8s `securityContext`.
+The §29 changelog (waves 0–9) is the authoritative
+history of what was done.
 
 ---
 
@@ -1420,13 +1415,52 @@ code, deploy-only for the manifests.
 
 Files: 3 changed, +11 / −6.
 
-### 29.7 Wave 6 — plan-file sync (this commit)
+### 29.7 Wave 6 — plan-file sync (commit `11f894a`)
 
 Strike completed items from §26, expand the changelog
 in §29, mark the open items in §26.5 so a future agent
 reading the plan knows exactly what's left.
 
-### 29.8 Summary
+### 29.10 Wave 7 — GIT_SHA from CI (commit `6591ffb`)
+
+B16: `GIT_SHA=${{ github.sha }}` added to the workflow-level
+`env` block and the release-build step's `env` (explicit so
+the consumption site is obvious). The
+`build_info{git_sha="..."}` Prometheus metric now reports
+the real commit on CI-built binaries. Local cargo build
+still falls back to `"unknown"`.
+
+Files: 1 changed, +11.
+
+### 29.11 Wave 8 — k8s NET_BIND_SERVICE (commit `a811ed2`)
+
+B18: k8s `securityContext.capabilities` was `drop: [ALL]`,
+which prevents the NTP server from binding UDP/123 as a
+non-root user. Add `NET_BIND_SERVICE` to `capabilities.add`
+with an inline comment explaining the trade-off and how to
+remove the add if the deployment is reconfigured to a
+high-numbered port.
+
+Files: 1 changed, +9.
+
+### 29.12 Wave 9 — WebSocket env-var lift (commit `2aaa595`)
+
+B7: `WS_UPDATE_INTERVAL_MS` and `WS_MAX_DURATION_SECS` were
+read from `std::env` on every WebSocket connection. New
+`WsConfig` struct in `config.rs`; `Config::from_env` reads
+the vars once and `Config::validate` enforces
+`update_interval_ms >= 1`. The per-connection handler reads
+`state.config.ws.{...}`. A rolling deploy now picks up the
+new values without dropping connections, the per-handler
+syscall is gone, and validation is centralized. The
+per-handler divide-by-zero guard stays as defense in depth.
+Test `test_config_validation` now also exercises the
+`update_interval_ms = 0` case. `AGENTS.md` updated to
+reflect that WS env vars now flow through `Config`.
+
+Files: 2 changed, +51 / −18.
+
+### 29.13 Summary
 
 | Wave | Theme | Commit | Files | Net | Bugs closed |
 |---|---|---|---|---|---|
@@ -1436,19 +1470,21 @@ reading the plan knows exactly what's left.
 | 3 | RFC 5905 T1–T4 | `ca190b6` | 2 | +144 | B13 |
 | 4 | AppError refactor | `935755e` | 2 | +65 | B19 |
 | 5 | Ops polish | `a21e874` | 3 | +5 | B17, B20, B21 |
-| 6 | Plan sync | (this) | 1 | 0 | — |
-| **Total** | | | **34 files** | **+847 / −1,033** | **18 of 23 findings resolved** |
+| 6 | Plan sync | `11f894a` | 1 | +1457 | — |
+| 7 | GIT_SHA from CI | `6591ffb` | 1 | +11 | B16 |
+| 8 | k8s NET_BIND_SERVICE | `a811ed2` | 1 | +9 | B18 |
+| 9 | WS env-var lift | `2aaa595` | 2 | +33 | B7 |
+| **Total** | | | **38 files** | **+2357 / −1,031** | **All 23 of 23 findings resolved** |
 
-Remaining (deferred to follow-up PRs): B7, B16, B18.
+### 29.14 Test inventory
 
-### 29.9 Test inventory
-
-After all six waves:
+After all nine waves:
 
 - 46 unit tests in `src/` (up from 33 at the start of
   wave 0; new tests cover the NTP protocol codec, the
   real-UDP server roundtrip, the RFC 5905 four-tuple
-  math, and the AppError JSON shape).
+  math, the AppError JSON shape, and the WS config
+  validation).
 - 7 integration tests in `tests/integration_api.rs` (all
   still `assert!(true, ...)` placeholders — see P3 in
   §26.4).
