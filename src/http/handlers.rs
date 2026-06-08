@@ -1,87 +1,86 @@
 use super::state::AppState;
-use axum::{Json, extract::State, http::StatusCode, response::Response};
+use crate::errors::AppError;
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// GET /time - Returns current NTP-derived time
-pub async fn time_handler(State(state): State<Arc<AppState>>) -> Response {
+/// GET /time - Returns current NTP-derived time.
+///
+/// Returns `Result<Response, AppError>`. The `AppError::NotSynced`
+/// variant triggers a 503 with the configured `MSG_ERROR` /
+/// `ERROR_TEXT_NO_SYNC` strings, preserving the pre-refactor JSON
+/// shape exactly. Success paths (real NTP time and the
+/// `REQUIRE_SYNC=false` system-clock fallback) build 200 responses
+/// inline.
+pub async fn time_handler(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
     let start = Instant::now();
 
-    let (response, success) = match state.timebase.now_ms() {
-        Some(epoch_ms) => {
-            // Determine if serving from cache
-            let is_stale = state
-                .get_staleness_seconds()
-                .map(|s| s > state.config.ntp.max_staleness_secs)
-                .unwrap_or(false);
-
-            // PERFORMANCE: Update cache with current time, then get pre-serialized JSON
-            // This avoids json!() macro and serde overhead (still faster than original)
-            state.time_cache.update(epoch_ms, is_stale);
-            let json_body = state.time_cache.get_json(is_stale);
-
-            let resp = axum::response::Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from((*json_body).clone()))
-                .unwrap();
-            (resp, true)
-        }
-        None => {
-            // Not yet synced
-            if state.config.ntp.require_sync {
-                let body = json!({
-                    "message": &state.config.messages.error,
-                    "status": 503,
-                    "data": 0,
-                    "error": &state.config.messages.error_no_sync,
-                });
-
-                let resp = axum::response::Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::to_string(&body).unwrap(),
-                    ))
-                    .unwrap();
-                (resp, false)
-            } else {
-                // If REQUIRE_SYNC is false, return system time
-                let epoch_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-
-                let body = json!({
-                    "message": &state.config.messages.ok,
-                    "status": 200,
-                    "data": epoch_ms,
-                });
-
-                let resp = axum::response::Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::to_string(&body).unwrap(),
-                    ))
-                    .unwrap();
-                (resp, true)
-            }
-        }
+    // Build the response (or error) based on timebase state.
+    let result: Result<Response, AppError> = match state.timebase.now_ms() {
+        Some(epoch_ms) => Ok(build_time_response(&state, epoch_ms)),
+        None if state.config.ntp.require_sync => Err(AppError::NotSynced {
+            message: state.config.messages.error.clone(),
+            error: state.config.messages.error_no_sync.clone(),
+        }),
+        None => Ok(build_system_clock_response(&state)),
     };
 
-    // Record latency: only count successes (2xx) as "success"; 5xx is
-    // tracked as an error so error rate / avg latency aren't polluted
-    // by the pre-sync window.
+    // Record perf metrics. 2xx → success; 5xx (NotSynced) → error.
     let latency_us = start.elapsed().as_micros() as u64;
-    if success {
-        state.perf_metrics.record_success(latency_us);
-    } else {
-        state.perf_metrics.record_error();
+    match &result {
+        Ok(_) => state.perf_metrics.record_success(latency_us),
+        Err(_) => state.perf_metrics.record_error(),
     }
 
-    response
+    result
+}
+
+/// Build the 200 OK response for the synced path. Uses the
+/// pre-serialized JSON cache (zero-copy via `Arc<String>`) so the
+/// hot path stays fast.
+fn build_time_response(state: &AppState, epoch_ms: i64) -> Response {
+    // Determine if serving from cache (staleness > max_staleness_secs)
+    let is_stale = state
+        .get_staleness_seconds()
+        .map(|s| s > state.config.ntp.max_staleness_secs)
+        .unwrap_or(false);
+
+    // PERFORMANCE: Update cache with current time, then get
+    // pre-serialized JSON. This avoids json!() macro and serde
+    // overhead on the hot path.
+    state.time_cache.update(epoch_ms, is_stale);
+    let json_body = state.time_cache.get_json(is_stale);
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from((*json_body).clone()))
+        .expect("failed to build /time response")
+}
+
+/// Build the 200 OK response for the `REQUIRE_SYNC=false` fallback,
+/// where the service reports the OS wall clock instead of the
+/// NTP-derived time. Defeats the "NTP-authoritative" design but
+/// useful for development; never enabled in production.
+fn build_system_clock_response(state: &AppState) -> Response {
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let body = json!({
+        "message": &state.config.messages.ok,
+        "status": 200,
+        "data": epoch_ms,
+    });
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// GET /healthz - Liveness probe
@@ -249,10 +248,19 @@ mod tests {
     #[tokio::test]
     async fn test_time_before_sync() {
         let state = create_test_state();
-        let response = time_handler(State(state.clone())).await;
+        let result = time_handler(State(state.clone())).await;
 
         if state.config.ntp.require_sync {
+            // The handler should return Err(NotSynced) which
+            // IntoResponse maps to 503.
+            let err = result.expect_err("expected Err before first sync");
+            let response = err.into_response();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        } else {
+            // REQUIRE_SYNC=false: the system-clock fallback is
+            // returned as a 200 Ok.
+            let response = result.expect("expected Ok with REQUIRE_SYNC=false");
+            assert_eq!(response.status(), StatusCode::OK);
         }
     }
 
@@ -272,5 +280,32 @@ mod tests {
         let metrics_output = metrics_handler(State(state)).await;
 
         assert!(metrics_output.contains("build_info"));
+    }
+
+    #[tokio::test]
+    async fn app_error_not_synced_json_shape_matches_handler() {
+        // The JSON body for the 503 path must match what the
+        // handler used to build inline. Carries both `message`
+        // (typically "error" or the configured value) and the
+        // human-readable `error` text.
+        use crate::errors::AppError;
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let err = AppError::NotSynced {
+            message: "error".to_string(),
+            error: "Service not yet synchronized with NTP".to_string(),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("body read");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("body parse");
+        assert_eq!(json["message"], "error");
+        assert_eq!(json["status"], 503);
+        assert_eq!(json["data"], 0);
+        assert_eq!(json["error"], "Service not yet synchronized with NTP");
     }
 }
