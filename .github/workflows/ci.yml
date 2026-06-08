@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # B16: passed to the build via option_env!("GIT_SHA") in
+  # src/metrics.rs so the build_info{git_sha="..."} metric reports
+  # the real commit instead of "unknown". On non-CI builds (local
+  # cargo build) the macro returns None and the metric falls back
+  # to "unknown", which is the existing behavior.
+  GIT_SHA: ${{ github.sha }}
 
 jobs:
   fmt:
@@ -115,6 +121,11 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release binary
+        # GIT_SHA is inherited from the workflow-level env block
+        # (see top of file) and consumed by option_env!("GIT_SHA")
+        # in src/metrics.rs:193.
+        env:
+          GIT_SHA: ${{ github.sha }}
         run: cargo build --release --verbose
 
       - name: Upload artifact
