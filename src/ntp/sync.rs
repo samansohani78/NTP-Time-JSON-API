@@ -149,7 +149,9 @@ impl NtpSyncer {
                 // Current server is still responding
                 let current_rtt_ms = current_result.rtt.as_millis();
                 let best_rtt_ms = best.rtt.as_millis();
-                let rtt_improvement = current_rtt_ms as i64 - best_rtt_ms as i64;
+                // Positive = current is slower than best (improvement available).
+                // Negative = current is faster than best (no improvement).
+                let rtt_diff_ms = current_rtt_ms as i64 - best_rtt_ms as i64;
 
                 // Switch if new server is significantly better (50ms+ improvement)
                 // OR if current server is no longer the best by accuracy
@@ -161,7 +163,7 @@ impl NtpSyncer {
                         "Current NTP server is still the best (sticky)"
                     );
                     current_result.clone()
-                } else if rtt_improvement >= 50 {
+                } else if rtt_diff_ms >= 50 {
                     // New server is significantly faster (50ms+ better)
                     *self.current_server.write().await = Some(best.server.clone());
                     info!(
@@ -169,7 +171,7 @@ impl NtpSyncer {
                         old_rtt_ms = current_rtt_ms,
                         new_server = %best.server,
                         new_rtt_ms = best_rtt_ms,
-                        improvement_ms = rtt_improvement,
+                        rtt_diff_ms = rtt_diff_ms,
                         "Switching to better NTP server (50ms+ faster)"
                     );
                     best
@@ -180,7 +182,7 @@ impl NtpSyncer {
                         current_rtt_ms = current_rtt_ms,
                         best_server = %best.server,
                         best_rtt_ms = best_rtt_ms,
-                        rtt_diff_ms = rtt_improvement,
+                        rtt_diff_ms = rtt_diff_ms,
                         "Keeping current NTP server (new server not significantly better)"
                     );
                     current_result.clone()
