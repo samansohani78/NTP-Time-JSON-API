@@ -2,6 +2,9 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct ServerStats {
+    /// Server address. Kept for log/debug visibility; not used by the
+    /// stats logic itself (callers index the map by address).
+    #[allow(dead_code)]
     pub address: String,
     pub last_rtt: Option<Duration>,
     pub last_success: Option<Instant>,
@@ -61,15 +64,6 @@ impl ServerStats {
     pub fn is_available(&self) -> bool {
         // Server is available if not disabled and has had at least one success
         !self.disabled && self.last_success.is_some()
-    }
-
-    #[allow(dead_code)]
-    pub fn rtt_score(&self) -> Option<Duration> {
-        if self.is_healthy() {
-            self.last_rtt
-        } else {
-            None
-        }
     }
 }
 

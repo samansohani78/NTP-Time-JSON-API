@@ -87,37 +87,11 @@ impl NtpSyncer {
                 }
                 Ok(Err(e)) => {
                     warn!(server = %server, error = %e, "NTP query failed");
-                    let mut stats_write = self.stats.write().await;
-                    if let Some(stat) = stats_write.get_mut(&server) {
-                        let just_disabled =
-                            stat.record_failure(self.config.max_consecutive_failures);
-                        if just_disabled {
-                            warn!(
-                                server = %server,
-                                consecutive_failures = stat.consecutive_failures,
-                                threshold = self.config.max_consecutive_failures,
-                                "NTP server disabled after exceeding failure threshold"
-                            );
-                        }
-                    }
-                    drop(stats_write);
+                    self.record_server_failure(&server).await;
                 }
                 Err(e) => {
                     error!(server = %server, error = %e, "NTP query task panicked");
-                    let mut stats_write = self.stats.write().await;
-                    if let Some(stat) = stats_write.get_mut(&server) {
-                        let just_disabled =
-                            stat.record_failure(self.config.max_consecutive_failures);
-                        if just_disabled {
-                            warn!(
-                                server = %server,
-                                consecutive_failures = stat.consecutive_failures,
-                                threshold = self.config.max_consecutive_failures,
-                                "NTP server disabled after exceeding failure threshold"
-                            );
-                        }
-                    }
-                    drop(stats_write);
+                    self.record_server_failure(&server).await;
                 }
             }
         }
@@ -287,6 +261,28 @@ impl NtpSyncer {
     /// Get current server statistics
     pub async fn get_stats(&self) -> HashMap<String, ServerStats> {
         self.stats.read().await.clone()
+    }
+
+    /// Record a server-side failure (query error or task panic) for the
+    /// given server, auto-disabling it if the consecutive-failure
+    /// threshold is reached.
+    ///
+    /// Both the query-failed (`Ok(Err(_))`) and task-panicked (`Err(_)`)
+    /// arms of the result-collection loop funnel through here so the
+    /// stats + log lines stay in lockstep.
+    async fn record_server_failure(&self, server: &str) {
+        let mut stats_write = self.stats.write().await;
+        if let Some(stat) = stats_write.get_mut(server) {
+            let just_disabled = stat.record_failure(self.config.max_consecutive_failures);
+            if just_disabled {
+                warn!(
+                    server = %server,
+                    consecutive_failures = stat.consecutive_failures,
+                    threshold = self.config.max_consecutive_failures,
+                    "NTP server disabled after exceeding failure threshold"
+                );
+            }
+        }
     }
 }
 

@@ -1,4 +1,3 @@
-use super::stats::ServerStats;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -13,33 +12,6 @@ pub struct NtpResult {
 pub struct ServerSelector;
 
 impl ServerSelector {
-    /// Select servers to query based on RTT-min strategy
-    #[allow(dead_code)]
-    pub fn select_servers_for_query(stats: &[ServerStats], sample_count: usize) -> Vec<String> {
-        // Filter out disabled servers first
-        let mut server_list: Vec<_> = stats.iter().filter(|s| !s.disabled).collect();
-
-        // If all servers are disabled, include them anyway (give them a chance to recover)
-        if server_list.is_empty() {
-            server_list = stats.iter().collect();
-        }
-
-        // Sort by RTT (healthy servers with low RTT first, then others)
-        server_list.sort_by(|a, b| match (a.rtt_score(), b.rtt_score()) {
-            (Some(rtt_a), Some(rtt_b)) => rtt_a.cmp(&rtt_b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        });
-
-        // Take top N servers
-        server_list
-            .into_iter()
-            .take(sample_count.max(1))
-            .map(|s| s.address.clone())
-            .collect()
-    }
-
     /// Select the best result from multiple NTP responses using accuracy-first algorithm
     ///
     /// Algorithm:
@@ -61,7 +33,11 @@ impl ServerSelector {
             return results.into_iter().next();
         }
 
-        // Calculate median offset for outlier detection
+        // Calculate median offset for outlier detection.
+        // Convention: for even-length inputs we pick the upper of the
+        // two middle values. This biases outlier detection slightly
+        // toward "include the optimistic half" — acceptable for our
+        // use case where we then take the inlier closest to median.
         let mut offsets: Vec<i64> = results.iter().map(|r| r.offset_ms).collect();
         offsets.sort_unstable();
         let median_offset = offsets[offsets.len() / 2];
@@ -112,21 +88,14 @@ impl ServerSelector {
         }
 
         // CRITICAL CHANGE: Select server with offset closest to median (most accurate)
-        // Use RTT only as tiebreaker when accuracy is similar
+        // Use RTT only as tiebreaker when accuracy is similar.
+        // (offset_dist, rtt) ordering gives lexicographic comparison:
+        // primary key is accuracy, secondary key is latency.
         let best = inliers
             .iter()
-            .min_by(|a, b| {
-                let a_offset_dist = (a.offset_ms - median_offset).abs();
-                let b_offset_dist = (b.offset_ms - median_offset).abs();
-
-                // Primary: prefer offset closer to median (better agreement)
-                match a_offset_dist.cmp(&b_offset_dist) {
-                    std::cmp::Ordering::Equal => {
-                        // Tiebreaker: if offsets are equal, prefer lower RTT
-                        a.rtt.cmp(&b.rtt)
-                    }
-                    other => other,
-                }
+            .min_by_key(|r| {
+                let offset_dist = (r.offset_ms - median_offset).abs();
+                (offset_dist, r.rtt)
             })
             .cloned()?;
 
@@ -144,33 +113,6 @@ impl ServerSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_select_servers_for_query() {
-        let mut stats = vec![
-            ServerStats::new("server1:123".to_string()),
-            ServerStats::new("server2:123".to_string()),
-            ServerStats::new("server3:123".to_string()),
-        ];
-
-        // Server 2 has best RTT
-        stats[1].record_success(Duration::from_millis(10));
-        // Server 1 has worse RTT
-        stats[0].record_success(Duration::from_millis(50));
-        // Server 3 has no success yet
-
-        let selected = ServerSelector::select_servers_for_query(&stats, 2);
-        assert_eq!(selected.len(), 2);
-        // Server 2 should be first (best RTT)
-        assert_eq!(selected[0], "server2:123");
-
-        // Test disabled server filtering
-        stats[1].disabled = true; // Disable the best server
-        let selected = ServerSelector::select_servers_for_query(&stats, 2);
-        assert_eq!(selected.len(), 2);
-        // Server 2 should not be in the list now
-        assert!(!selected.contains(&"server2:123".to_string()));
-    }
 
     #[test]
     fn test_select_best_result_single() {

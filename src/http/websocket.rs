@@ -28,12 +28,19 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
     info!("WebSocket client connected");
 
     // Configuration
+    // WS_UPDATE_INTERVAL_MS=0 is treated as "unset" (fall back to
+    // default); a 0 interval would cause a divide-by-zero in
+    // max_updates below. The fallback default is 1s.
     let update_interval_ms = std::env::var("WS_UPDATE_INTERVAL_MS")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1000); // Default: 1 second
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(1000);
 
-    let max_duration_secs = std::env::var("WS_MAX_DURATION_SECS")
+    // WS_MAX_DURATION_SECS=0 means "unlimited" (no auto-close). Any
+    // other value caps the connection length. saturating_mul protects
+    // against absurdly large values overflowing u64.
+    let max_duration_secs: u64 = std::env::var("WS_MAX_DURATION_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3600); // Default: 1 hour
@@ -62,7 +69,15 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
     let send_task = tokio::spawn(async move {
         let mut tick = interval(Duration::from_millis(update_interval_ms));
         let mut count = 0u64;
-        let max_updates = (max_duration_secs * 1000) / update_interval_ms;
+        // u64::MAX here means "never reach the cap" — used when
+        // max_duration_secs is 0 (unlimited). saturating_mul
+        // prevents an absurdly large max_duration_secs from
+        // overflowing the multiplication.
+        let max_updates = if max_duration_secs == 0 {
+            u64::MAX
+        } else {
+            max_duration_secs.saturating_mul(1000) / update_interval_ms
+        };
 
         loop {
             tick.tick().await;
