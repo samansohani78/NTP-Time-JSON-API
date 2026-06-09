@@ -39,7 +39,7 @@ rand = "0.10.1"
 parking_lot = "0.12.5"
 socket2 = "0.6.4"
 chrono = "0.4.45"
-futures-util = "0.3.31"
+futures-util = "0.3.32"
 once_cell = "1.21.4"
 
 # Performance optimization
