@@ -718,6 +718,340 @@ async fn rate_limited_time_full_does_not_500() {
     );
 }
 
+// ── v1.1.0: holdover-first behavior ──────────────────────────────────────────
+
+/// Default mode: high uncertainty after seed → HTTP 200 with serve_state="degraded".
+#[tokio::test]
+async fn after_ntp_seed_high_uncertainty_returns_200_degraded_by_default() {
+    use ntp_time_json_api::ntp::SyncQuality;
+    let upstream = common::start_mock_ntp_upstream(1_704_067_200_000).await;
+    let server = common::spawn_server_synced(&upstream).await;
+
+    // Override last_sync_quality with very high dispersion (well above ok_max=50ms)
+    let past = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    *server.state.last_sync_quality.write() = Some(SyncQuality {
+        upstream_root_delay_ms: 10,
+        upstream_root_dispersion_ms: 80, // pushes uncertainty above 50ms ok_max
+        precision_log2: -10,
+        stratum: 2,
+        leap: 0,
+        measured_rtt_ms: 5,
+        jitter_ms: 0,
+        offset_ms: 1,
+        last_sync_instant: past,
+        selected_server: "ntp.test:123".into(),
+    });
+
+    let resp = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    // Default mode: still 200 (holdover-first)
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "default mode: high uncertainty must still return 200"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], 200);
+}
+
+/// Strict SLA mode: high uncertainty after seed → HTTP 503.
+#[tokio::test]
+async fn strict_mode_high_uncertainty_returns_503() {
+    use ntp_time_json_api::ntp::SyncQuality;
+    let upstream = common::start_mock_ntp_upstream(1_704_067_200_000).await;
+    let server = common::spawn_server_synced_strict(&upstream).await;
+
+    // Raise dispersion beyond ok_max and degraded_max to trigger "stopped"
+    let past = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    *server.state.last_sync_quality.write() = Some(SyncQuality {
+        upstream_root_delay_ms: 10,
+        upstream_root_dispersion_ms: 500, // way above degraded_max=1000ms default
+        precision_log2: -10,
+        stratum: 2,
+        leap: 0,
+        measured_rtt_ms: 5,
+        jitter_ms: 0,
+        offset_ms: 1,
+        last_sync_instant: past,
+        selected_server: "ntp.test:123".into(),
+    });
+
+    let resp = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    // strict mode: high uncertainty → 503
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "strict mode: high uncertainty must return 503"
+    );
+}
+
+/// After a good seed, NTP sync failures must not degrade /time to 503.
+#[tokio::test]
+async fn after_good_seed_future_ntp_failures_keep_time_200() {
+    let upstream = common::start_mock_ntp_upstream(1_704_067_200_000).await;
+    let server = common::spawn_server_synced(&upstream).await;
+
+    // Simulate NTP failures without clearing last_sync_quality
+    for _ in 0..5 {
+        server.state.record_sync_failure();
+    }
+
+    let resp = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/time must stay 200 after NTP failures"
+    );
+}
+
+/// After a good seed, if last_sync_quality is cleared (e.g. no quorum), /time
+/// must return 200 with source="holdover" (not 503).
+#[tokio::test]
+async fn no_quorum_after_seed_keeps_time_200() {
+    let upstream = common::start_mock_ntp_upstream(1_704_067_200_000).await;
+    let server = common::spawn_server_synced(&upstream).await;
+
+    // Simulate no-quorum by clearing the quality (TimeBase remains seeded)
+    *server.state.last_sync_quality.write() = None;
+
+    let resp = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "no-quorum after seed must return 200 (holdover)"
+    );
+
+    // /time/full should report holdover source
+    let resp_full = client()
+        .await
+        .get(format!("{}/time/full", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp_full.json().await.unwrap();
+    assert_eq!(body["source"], "holdover", "no-quorum must report holdover");
+}
+
+/// When admin POST /admin/time/override is called with NTP never synced,
+/// TimeBase is permanently seeded — /time returns 200 even after override TTL expires.
+#[tokio::test]
+async fn manual_seed_without_ntp_returns_200() {
+    let server = common::spawn_server_admin_unsynced("test-token-seed").await;
+    let token = "test-token-seed";
+
+    // Before override: unsynced, expect 503
+    let pre = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pre.status().as_u16(), 503, "must be 503 before any seed");
+
+    // POST manual override with a reasonable epoch
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let resp = client()
+        .await
+        .post(format!("{}/admin/time/override", server.base_url))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({
+            "epoch_ms": epoch_ms,
+            "reason": "manual seed test",
+            "ttl_seconds": 5,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "POST override must succeed");
+
+    // While override is active: 200 with source="manual"
+    let active = client()
+        .await
+        .get(format!("{}/time/full", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = active.json().await.unwrap();
+    assert_eq!(body["status"], 200);
+    assert_eq!(body["source"], "manual");
+
+    // After manually deleting the override: TimeBase seeded → holdover, still 200
+    let del = client()
+        .await
+        .delete(format!("{}/admin/time/override", server.base_url))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 200);
+
+    let post_delete = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        post_delete.status().as_u16(),
+        200,
+        "after override delete, TimeBase still seeded → must return 200"
+    );
+}
+
+/// A server seeded from persisted state (no live NTP) must return 200 with holdover.
+#[tokio::test]
+async fn persisted_state_restart_without_ntp_returns_200_holdover() {
+    let fixed_epoch = 1_704_067_200_000i64;
+    let server = common::spawn_server_holdover_seeded(fixed_epoch).await;
+
+    let resp = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "persisted-state holdover must return 200"
+    );
+
+    let resp_full = client()
+        .await
+        .get(format!("{}/time/full", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp_full.json().await.unwrap();
+    assert_eq!(body["status"], 200);
+    assert_eq!(body["source"], "holdover");
+    assert_eq!(body["serve_state"], "holdover");
+    let epoch_ms = body["data"].as_i64().expect("data must be i64");
+    assert!(
+        (epoch_ms - fixed_epoch).abs() < 60_000,
+        "holdover epoch must be near fixed_epoch: got {epoch_ms}"
+    );
+}
+
+/// /time/full must show holdover source/serve_state when quality is stale/no-quorum.
+#[tokio::test]
+async fn time_full_shows_holdover_diagnostics() {
+    let upstream = common::start_mock_ntp_upstream(1_704_067_200_000).await;
+    let server = common::spawn_server_synced(&upstream).await;
+
+    // Clear NTP quality to simulate no-quorum after seed
+    *server.state.last_sync_quality.write() = None;
+
+    let resp = client()
+        .await
+        .get(format!("{}/time/full", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["source"], "holdover", "source must be holdover");
+    assert_eq!(
+        body["serve_state"], "holdover",
+        "serve_state must be holdover"
+    );
+}
+
+/// /status correctly reports each state: unsynced, synced (ok), holdover, manual.
+#[tokio::test]
+async fn status_shows_uninitialized_synced_holdover_manual_correctly() {
+    let fixed_epoch = 1_704_067_200_000i64;
+    let upstream = common::start_mock_ntp_upstream(fixed_epoch).await;
+
+    // State 1: unsynced
+    let unsynced_server = common::spawn_server_unsynced().await;
+    let resp = client()
+        .await
+        .get(format!("{}/status", unsynced_server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "/status is always 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["source"], "unsynced");
+    assert_eq!(body["serve_state"], "unsynced");
+
+    // State 2: synced (ok)
+    let synced_server = common::spawn_server_synced(&upstream).await;
+    let resp = client()
+        .await
+        .get(format!("{}/status", synced_server.base_url))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["serve_state"], "ok", "fresh sync must be ok");
+
+    // State 3: holdover (clear quality from synced server)
+    *synced_server.state.last_sync_quality.write() = None;
+    let resp = client()
+        .await
+        .get(format!("{}/status", synced_server.base_url))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["source"], "holdover");
+    assert_eq!(body["serve_state"], "holdover");
+}
+
+/// /time must never query NTP directly — verify by pointing at unreachable NTP
+/// and confirming a seeded holdover server returns 200 with no latency spike.
+#[tokio::test]
+async fn time_request_path_does_not_query_ntp() {
+    let fixed_epoch = 1_704_067_200_000i64;
+    // Seeded from persisted state: NTP is unreachable
+    let server = common::spawn_server_holdover_seeded(fixed_epoch).await;
+
+    let start = std::time::Instant::now();
+    let resp = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.status().as_u16(), 200);
+    // If /time queried NTP, it would block for the timeout (default 5s).
+    // Requiring <500ms to complete demonstrates no NTP query occurs.
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "/time took {elapsed:?} — suggests it may be querying NTP"
+    );
+}
+
 /// /status must NOT 500 when rate limiting is enabled (ConnectInfo regression).
 #[tokio::test]
 async fn rate_limited_status_does_not_500() {

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 pub struct SetOverrideRequest {
@@ -169,6 +169,38 @@ pub async fn post_override(
         .map(|ntp| body.epoch_ms - ntp)
         .unwrap_or(0);
 
+    // If the TimeBase has never been seeded by NTP, seed it now with the manual
+    // epoch so the service keeps serving time even after this override expires.
+    // This implements durable manual-seed semantics: the monotonic clock
+    // continues advancing from the manual epoch, and future NTP can correct it.
+    if !state.timebase.has_synced() {
+        use crate::ntp::{SyncResult, selection::TimingSource};
+        let seed = SyncResult {
+            epoch_ms: body.epoch_ms,
+            server: "manual".to_string(),
+            rtt: std::time::Duration::ZERO,
+            instant: set_at_instant,
+            offset_ms: 0,
+            t1_client_send_ms: body.epoch_ms,
+            t2_server_recv_ms: body.epoch_ms,
+            t3_server_send_ms: body.epoch_ms,
+            t4_client_recv_ms: body.epoch_ms,
+            root_delay_ms: 0,
+            root_dispersion_ms: state.config.admin.dispersion_ms as u32,
+            stratum: 2,
+            leap: 0,
+            precision_log2: 0,
+            reference_id: u32::from_be_bytes(*b"MANU"),
+            timing_source: TimingSource::Estimated,
+        };
+        state.timebase.update(&seed);
+        info!(
+            epoch_ms = body.epoch_ms,
+            reason = %body.reason,
+            "Manual seed initialized TimeBase (NTP not yet available)"
+        );
+    }
+
     // Activate override in TimeBase atomics.
     state.timebase.set_manual(body.epoch_ms, body.ttl_seconds);
 
@@ -287,8 +319,9 @@ pub async fn delete_override(State(state): State<Arc<AppState>>) -> (StatusCode,
         state.metrics.time_source_mode.set(match quality.source {
             "ntp" => 0,
             "degraded" => 1,
+            "unsynced" => 2,
             "manual" => 3,
-            _ => 2, // unsynced
+            _ => 4, // "holdover"
         });
 
         if let Some(ov) = prev_state {

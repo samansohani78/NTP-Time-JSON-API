@@ -4,4 +4,5 @@ pub mod http;
 pub mod metrics;
 pub mod ntp;
 pub mod performance;
+pub mod persist;
 pub mod timebase;

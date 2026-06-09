@@ -10,6 +10,7 @@ pub struct Config {
     pub ntp: NtpConfig,
     pub ntp_server: NtpServerConfig,
     pub quality: QualityConfig,
+    pub persist: PersistConfig,
     pub ws: WsConfig,
     pub logging: LoggingConfig,
     pub messages: MessageConfig,
@@ -57,24 +58,42 @@ pub struct AdminConfig {
     pub dispersion_ms: u64,
 }
 
-/// Serve/stop SLA thresholds for the time-quality envelope (P0-4).
+/// Serve/stop SLA thresholds for the time-quality envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityConfig {
-    /// When false (default), any uncertainty above `serve_ok_max_uncertainty_ms`
-    /// causes `serve_state="stopped"` and a 503 response. When true, uncertainty
-    /// up to `serve_degraded_max_uncertainty_ms` returns 200 with
-    /// `source="degraded"`. Uncertainty beyond the degraded max always stops.
+    /// When `false` (default), the service is holdover-first: after any seed
+    /// (NTP, manual, or persisted), `/time` always returns HTTP 200 and reports
+    /// quality via headers and `serve_state`. Only returns 503 when completely
+    /// uninitialized (no seed) + `REQUIRE_SYNC=true`.
+    ///
+    /// When `true` (strict / opt-in for financial deployments), high uncertainty
+    /// returns 503 exactly as in the pre-v1.1 behaviour:
+    ///   uncertainty > `serve_ok_max_uncertainty_ms` + `ALLOW_DEGRADED=false` → 503
+    ///   uncertainty > `serve_degraded_max_uncertainty_ms` → 503 always
+    pub strict_sla_mode: bool,
+    /// In strict mode only: allow uncertainty in the degraded band to return 200.
+    /// Ignored when `strict_sla_mode=false`.
     pub allow_degraded: bool,
-    /// Max uncertainty (ms) to report `serve_state="ok"`.
-    /// Default 50 ms. Must be strictly less than `serve_degraded_max_uncertainty_ms`.
+    /// Max uncertainty (ms) to report `serve_state="ok"`. Default 50 ms.
     pub serve_ok_max_uncertainty_ms: f64,
-    /// Max uncertainty (ms) to serve at all (when `ALLOW_DEGRADED=true`).
-    /// Uncertainty above this always returns 503 regardless of `allow_degraded`.
-    /// Default 250 ms.
+    /// Max uncertainty (ms) for the degraded band (strict mode). Default 250 ms.
     pub serve_degraded_max_uncertainty_ms: f64,
     /// Max uncertainty (ms) for `/readyz` to return 200 after first sync.
-    /// Default 250 ms (matches `serve_degraded_max_uncertainty_ms`).
     pub readiness_max_uncertainty_ms: f64,
+}
+
+/// Persisted last-good state for restart recovery.
+///
+/// When `enabled=true`, the service writes a JSON snapshot to `file_path`
+/// after every successful NTP sync.  On the next startup, if NTP is
+/// unreachable, the snapshot is read and used to seed the `TimeBase` so
+/// the service can serve time in holdover mode until NTP recovers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistConfig {
+    /// Set `TIME_STATE_PERSIST_ENABLED=true` to enable. Default: false.
+    pub enabled: bool,
+    /// Path to the JSON state file. Default: `/var/lib/ntp-time-json-api/state.json`.
+    pub file_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,11 +385,17 @@ impl Config {
         let error_timeout = env_or_default("ERROR_TEXT_TIMEOUT", "Request timeout");
 
         // Quality / SLA config
+        let strict_sla_mode = env_or_parse("STRICT_SLA_MODE", false);
         let allow_degraded = env_or_parse("ALLOW_DEGRADED", false);
         let serve_ok_max_uncertainty_ms = env_or_parse("SERVE_OK_MAX_UNCERTAINTY_MS", 50.0f64);
         let serve_degraded_max_uncertainty_ms =
             env_or_parse("SERVE_DEGRADED_MAX_UNCERTAINTY_MS", 250.0f64);
         let readiness_max_uncertainty_ms = env_or_parse("READINESS_MAX_UNCERTAINTY_MS", 250.0f64);
+
+        // Persistence config
+        let persist_enabled = env_or_parse("TIME_STATE_PERSIST_ENABLED", false);
+        let persist_file =
+            env_or_default("TIME_STATE_FILE", "/var/lib/ntp-time-json-api/state.json");
 
         // P1-8: replica identity
         let replica_id = resolve_replica_id();
@@ -424,10 +449,15 @@ impl Config {
                 max_root_dispersion_ms: ntp_server_max_root_dispersion_ms,
             },
             quality: QualityConfig {
+                strict_sla_mode,
                 allow_degraded,
                 serve_ok_max_uncertainty_ms,
                 serve_degraded_max_uncertainty_ms,
                 readiness_max_uncertainty_ms,
+            },
+            persist: PersistConfig {
+                enabled: persist_enabled,
+                file_path: persist_file,
             },
             ws: WsConfig {
                 update_interval_ms: ws_update_interval_ms,
@@ -565,10 +595,15 @@ impl Default for Config {
                 max_root_dispersion_ms: 16_000,
             },
             quality: QualityConfig {
+                strict_sla_mode: false,
                 allow_degraded: false,
                 serve_ok_max_uncertainty_ms: 50.0,
                 serve_degraded_max_uncertainty_ms: 250.0,
                 readiness_max_uncertainty_ms: 250.0,
+            },
+            persist: PersistConfig {
+                enabled: false,
+                file_path: "/var/lib/ntp-time-json-api/state.json".to_string(),
             },
             ws: WsConfig {
                 update_interval_ms: 1000,

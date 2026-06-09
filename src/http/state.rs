@@ -170,12 +170,23 @@ impl AppState {
 
     /// Compute the current time-quality envelope.
     ///
-    /// Source precedence:
-    /// 1. Manual override active → source="manual", serve_state="ok"
-    /// 2. NTP synced (with thresholds ok_max=50 ms, degraded_max=250 ms by default)
-    /// 3. Unsynced → source="unsynced", serve_state="unsynced"
+    /// State machine (source / serve_state):
+    ///
+    /// ```text
+    /// MANUAL   — manual override active             → source="manual",   serve_state="ok"
+    /// SYNCED   — fresh NTP, low uncertainty          → source="ntp",      serve_state="ok"
+    /// DEGRADED — NTP seed, uncertainty in band       → source="degraded", serve_state="degraded"
+    /// HOLDOVER — NTP seed, stale or high uncertainty → source="holdover", serve_state="holdover"
+    /// STOPPED  — strict_sla_mode=true only           → source="degraded", serve_state="stopped"
+    /// UNSYNCED — no seed at all                      → source="unsynced", serve_state="unsynced"
+    /// ```
+    ///
+    /// In default mode (`strict_sla_mode=false`), DEGRADED and HOLDOVER both
+    /// return HTTP 200 — quality is communicated via headers and body fields,
+    /// not via the HTTP status code.  HTTP 503 is reserved for UNSYNCED
+    /// (when `REQUIRE_SYNC=true`) or STOPPED (strict mode only).
     pub fn compute_quality(&self) -> TimeQuality {
-        // ── Manual override path (highest priority) ───────────────────────────
+        // ── 1. Manual override (highest priority) ─────────────────────────────
         if self.timebase.is_manual_active() {
             let guard = self.override_state.read();
             if let Some(ov) = guard.as_ref() {
@@ -206,12 +217,55 @@ impl AppState {
             }
         }
 
-        // ── NTP path ──────────────────────────────────────────────────────────
+        // ── 2. NTP quality available ──────────────────────────────────────────
         let quality_guard = self.last_sync_quality.read();
-        match quality_guard.as_ref() {
-            None => TimeQuality {
-                source: "unsynced",
-                serve_state: "unsynced",
+        if let Some(q) = quality_guard.as_ref() {
+            let uncertainty_ms = q.compute_dispersion_ms();
+            let age_ms = q.last_sync_instant.elapsed().as_millis() as u64;
+            let age_secs = age_ms / 1000;
+            let is_stale = age_secs > self.config.ntp.max_staleness_secs;
+            let ok_max = self.config.quality.serve_ok_max_uncertainty_ms;
+            let degraded_max = self.config.quality.serve_degraded_max_uncertainty_ms;
+
+            let (source, serve_state) = if !is_stale && uncertainty_ms <= ok_max {
+                // SYNCED — fresh and within SLA
+                ("ntp", "ok")
+            } else if self.config.quality.strict_sla_mode {
+                // STRICT mode: may return "stopped" (opt-in, financial/critical deployments)
+                if uncertainty_ms <= degraded_max && self.config.quality.allow_degraded {
+                    ("degraded", "degraded")
+                } else {
+                    ("degraded", "stopped")
+                }
+            } else {
+                // DEFAULT mode: holdover-first — always serve after seed
+                if !is_stale && uncertainty_ms <= degraded_max {
+                    ("degraded", "degraded") // DEGRADED: within band, not stale
+                } else {
+                    ("holdover", "holdover") // HOLDOVER: stale or very high uncertainty
+                }
+            };
+
+            return TimeQuality {
+                source,
+                serve_state,
+                uncertainty_ms: Some(uncertainty_ms),
+                staleness_ms: Some(age_ms),
+                stratum: Some(q.stratum),
+                selected_server: Some(q.selected_server.clone()),
+                leap: Some(q.leap),
+                override_info: None,
+                selection: self.last_selection_diagnostics.read().clone(),
+            };
+        }
+        drop(quality_guard);
+
+        // ── 3. TimeBase seeded (e.g. by manual seed or persisted state) but
+        //       no NTP quality available yet — holdover with unknown uncertainty
+        if self.timebase.has_synced() {
+            return TimeQuality {
+                source: "holdover",
+                serve_state: "holdover",
                 uncertainty_ms: None,
                 staleness_ms: None,
                 stratum: None,
@@ -219,39 +273,20 @@ impl AppState {
                 leap: None,
                 override_info: None,
                 selection: self.last_selection_diagnostics.read().clone(),
-            },
-            Some(q) => {
-                let uncertainty_ms = q.compute_dispersion_ms();
-                let age_ms = q.last_sync_instant.elapsed().as_millis() as u64;
-                let age_secs = age_ms / 1000;
-                let is_stale = age_secs > self.config.ntp.max_staleness_secs;
-                let ok_max = self.config.quality.serve_ok_max_uncertainty_ms;
-                let degraded_max = self.config.quality.serve_degraded_max_uncertainty_ms;
+            };
+        }
 
-                let (source, serve_state) = if !is_stale && uncertainty_ms <= ok_max {
-                    ("ntp", "ok")
-                } else if uncertainty_ms <= degraded_max {
-                    if self.config.quality.allow_degraded {
-                        ("degraded", "degraded")
-                    } else {
-                        ("degraded", "stopped")
-                    }
-                } else {
-                    ("degraded", "stopped")
-                };
-
-                TimeQuality {
-                    source,
-                    serve_state,
-                    uncertainty_ms: Some(uncertainty_ms),
-                    staleness_ms: Some(age_ms),
-                    stratum: Some(q.stratum),
-                    selected_server: Some(q.selected_server.clone()),
-                    leap: Some(q.leap),
-                    override_info: None,
-                    selection: self.last_selection_diagnostics.read().clone(),
-                }
-            }
+        // ── 4. Completely unsynced ────────────────────────────────────────────
+        TimeQuality {
+            source: "unsynced",
+            serve_state: "unsynced",
+            uncertainty_ms: None,
+            staleness_ms: None,
+            stratum: None,
+            selected_server: None,
+            leap: None,
+            override_info: None,
+            selection: self.last_selection_diagnostics.read().clone(),
         }
     }
 }

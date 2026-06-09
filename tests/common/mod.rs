@@ -181,7 +181,8 @@ pub fn apply_sync_to_state(state: &AppState, outcome: &SyncOutcome) {
             "ok" => 0,
             "degraded" => 1,
             "stopped" => 2,
-            _ => 3,
+            "unsynced" => 3,
+            _ => 4, // "holdover"
         });
     state
         .metrics
@@ -190,8 +191,9 @@ pub fn apply_sync_to_state(state: &AppState, outcome: &SyncOutcome) {
         .set(match quality.source {
             "ntp" => 0,
             "degraded" => 1,
+            "unsynced" => 2,
             "manual" => 3,
-            _ => 2,
+            _ => 4, // "holdover"
         });
 
     let rtt_ms = result.rtt.as_millis() as u64;
@@ -457,6 +459,80 @@ pub async fn spawn_server_with_admin_and_ntp_server(
     let ntp_addr = start_ntp_server_component(&state, &config).await;
     let server = start_http_server(state).await;
     (server, ntp_addr)
+}
+
+/// Spawn an HTTP server that has never synced — but is seeded from a simulated
+/// persisted state (i.e. TimeBase has been updated with a synthetic SyncResult).
+/// `/time` should return 200 with `source="holdover"`.
+pub async fn spawn_server_holdover_seeded(epoch_ms: i64) -> TestServer {
+    use ntp_time_json_api::ntp::{SyncResult, selection::TimingSource};
+    let mut config = Config::default();
+    config.ntp.servers = vec!["127.0.0.1:1".to_string()]; // unreachable
+    config.ntp.require_sync = true;
+    config.ws.update_interval_ms = 100;
+    let config = Arc::new(config);
+    let state = build_state(config);
+    // Seed TimeBase as if loaded from persisted state, but do NOT populate last_sync_quality
+    let seed = SyncResult {
+        epoch_ms,
+        server: "persisted".to_string(),
+        rtt: std::time::Duration::ZERO,
+        instant: std::time::Instant::now(),
+        offset_ms: 0,
+        t1_client_send_ms: epoch_ms,
+        t2_server_recv_ms: epoch_ms,
+        t3_server_send_ms: epoch_ms,
+        t4_client_recv_ms: epoch_ms,
+        root_delay_ms: 0,
+        root_dispersion_ms: 1000,
+        stratum: 2,
+        leap: 0,
+        precision_log2: 0,
+        reference_id: u32::from_be_bytes(*b"LOAD"),
+        timing_source: TimingSource::Estimated,
+    };
+    state.timebase.update(&seed);
+    start_http_server(state).await
+}
+
+/// Spawn an HTTP server synced with `strict_sla_mode=true`.
+/// High uncertainty will cause `/time` to return 503.
+pub async fn spawn_server_synced_strict(upstream: &MockNtpUpstream) -> TestServer {
+    let mut config = Config::default();
+    config.ntp.servers = vec![upstream.addr.to_string()];
+    config.ntp.timeout_secs = 5;
+    config.ntp.require_sync = true;
+    config.ntp.selection.min_quorum = 1;
+    config.ws.update_interval_ms = 100;
+    config.quality.strict_sla_mode = true;
+    config.quality.allow_degraded = false;
+    let config = Arc::new(config);
+
+    let state = build_state(config.clone());
+    let syncer = NtpSyncer::new(Arc::new(config.ntp.clone()));
+    let outcome = syncer
+        .sync()
+        .await
+        .expect("initial sync against mock NTP upstream should succeed");
+    apply_sync_to_state(&state, &outcome);
+
+    start_http_server(state).await
+}
+
+/// Spawn an HTTP server with admin API enabled but unsynced (no initial NTP sync).
+pub async fn spawn_server_admin_unsynced(admin_token: &str) -> TestServer {
+    let mut config = Config::default();
+    config.ntp.servers = vec!["127.0.0.1:1".to_string()]; // unreachable
+    config.ntp.require_sync = true;
+    config.ntp.selection.min_quorum = 1;
+    config.ws.update_interval_ms = 100;
+    config.admin.enabled = true;
+    config.admin.token = admin_token.to_string();
+    config.admin.max_ttl_secs = 300;
+    config.admin.max_jump_ms = 10_000_000; // large so epoch_ms is accepted
+    config.admin.allow_force = true;
+    config.admin.dispersion_ms = 1000;
+    start_http_server(build_state(Arc::new(config))).await
 }
 
 /// Start only the UDP NTP server component on an ephemeral port.

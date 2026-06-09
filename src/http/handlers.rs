@@ -9,22 +9,26 @@ use std::time::Instant;
 ///
 /// Body is backward-compatible JSON `{message, status, data}`.
 /// Quality headers are added to every 200 response:
-/// - `X-Time-Source`: `ntp` | `degraded` | `unsynced`
-/// - `X-Time-Serve-State`: `ok` | `degraded` | `stopped` | `unsynced`
-/// - `X-Time-Uncertainty-Ms`: computed dispersion in ms (omitted when unsynced)
-/// - `X-Time-Stratum`: upstream stratum (omitted when unsynced)
-/// - `X-Time-Staleness-Ms`: ms since last sync (omitted when unsynced)
-/// - `X-Time-Selected-Server`: NTP server used for last sync (omitted when unsynced)
+/// - `X-Time-Source`: `ntp` | `degraded` | `holdover` | `manual` | `unsynced`
+/// - `X-Time-Serve-State`: `ok` | `degraded` | `holdover` | `stopped` | `unsynced`
+/// - `X-Time-Uncertainty-Ms`: computed dispersion in ms (omitted when unsynced/holdover)
+/// - `X-Time-Stratum`: upstream stratum (omitted when unsynced/holdover)
+/// - `X-Time-Staleness-Ms`: ms since last sync (omitted when unsynced/holdover)
+/// - `X-Time-Selected-Server`: NTP server used for last sync (omitted when unsynced/holdover)
 ///
-/// Serve/stop policy (P0-4): when quality.serve_state == "stopped",
-/// returns 503 even if the timebase has synced.
+/// Default serve policy (holdover-first): after any seed (NTP, manual, or persisted),
+/// returns HTTP 200 for all quality states including degraded and holdover.
+/// HTTP 503 is only returned when uninitialized (no seed) + REQUIRE_SYNC=true,
+/// or when STRICT_SLA_MODE=true and uncertainty exceeds the configured threshold.
 pub async fn time_handler(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
     let start = Instant::now();
 
     let result: Result<Response, AppError> = match state.timebase.now_ms() {
         Some(epoch_ms) => {
             let quality = state.compute_quality();
-            if quality.serve_state == "stopped" {
+            // Only return 503 in strict SLA mode when serve_state="stopped".
+            // In default mode (strict_sla_mode=false), always serve 200 after seed.
+            if state.config.quality.strict_sla_mode && quality.serve_state == "stopped" {
                 Err(AppError::ServeStopped {
                     message: state.config.messages.error.clone(),
                     error: format!(
@@ -242,7 +246,8 @@ pub async fn time_full_handler(State(state): State<Arc<AppState>>) -> (StatusCod
 
     let (status_code, epoch_ms, message) = match state.timebase.now_ms() {
         Some(ms) => {
-            if quality.serve_state == "stopped" {
+            // In strict mode, honor "stopped". In default mode, always serve.
+            if state.config.quality.strict_sla_mode && quality.serve_state == "stopped" {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     0i64,
@@ -591,62 +596,95 @@ mod tests {
         assert!(q.uncertainty_ms.unwrap() < 50.0);
     }
 
+    // In default mode (strict_sla_mode=false), high uncertainty → "degraded" or "holdover" (200).
     #[tokio::test]
-    async fn quality_high_uncertainty_stops_when_allow_degraded_false() {
+    async fn quality_high_uncertainty_degraded_by_default() {
         let mut config = crate::config::Config::default();
+        // strict_sla_mode=false (the default) — do NOT set it; verify the default
+        config.quality.serve_ok_max_uncertainty_ms = 1.0;
+        config.quality.serve_degraded_max_uncertainty_ms = 10.0;
+        let state = create_test_state_with_config(Arc::new(config));
+        // uncertainty ≈ 8ms: above ok_max(1) but below degraded_max(10) → "degraded" not "stopped"
+        inject_sync_quality(&state, 5, 0);
+        let q = state.compute_quality();
+        assert_eq!(q.source, "degraded");
+        assert_eq!(q.serve_state, "degraded"); // 200 in default mode
+    }
+
+    // strict_sla_mode=true + allow_degraded=false → "stopped" when uncertainty > ok_max
+    #[tokio::test]
+    async fn quality_high_uncertainty_stops_when_strict_and_allow_degraded_false() {
+        let mut config = crate::config::Config::default();
+        config.quality.strict_sla_mode = true;
         config.quality.allow_degraded = false;
         config.quality.serve_ok_max_uncertainty_ms = 1.0;
         config.quality.serve_degraded_max_uncertainty_ms = 10.0;
         let state = create_test_state_with_config(Arc::new(config));
-        // upstream_dispersion=5ms → uncertainty ≈ 8ms, above ok_max(1) but below degraded_max(10)
         inject_sync_quality(&state, 5, 0);
         let q = state.compute_quality();
         assert_eq!(q.source, "degraded");
         assert_eq!(q.serve_state, "stopped");
     }
 
+    // strict_sla_mode=true + allow_degraded=true → "degraded" (200) in the band
     #[tokio::test]
-    async fn quality_high_uncertainty_degraded_when_allow_degraded_true() {
+    async fn quality_high_uncertainty_degraded_when_strict_and_allow_degraded_true() {
         let mut config = crate::config::Config::default();
+        config.quality.strict_sla_mode = true;
         config.quality.allow_degraded = true;
         config.quality.serve_ok_max_uncertainty_ms = 1.0;
         config.quality.serve_degraded_max_uncertainty_ms = 10.0;
         let state = create_test_state_with_config(Arc::new(config));
-        // upstream_dispersion=5ms → uncertainty ≈ 8ms, above ok_max(1) but below degraded_max(10)
         inject_sync_quality(&state, 5, 0);
         let q = state.compute_quality();
         assert_eq!(q.source, "degraded");
         assert_eq!(q.serve_state, "degraded");
     }
 
+    // In default mode, very high uncertainty → "holdover" (200), not "stopped"
     #[tokio::test]
-    async fn quality_beyond_degraded_max_always_stops() {
+    async fn quality_very_high_uncertainty_holdover_by_default() {
         let mut config = crate::config::Config::default();
+        config.quality.serve_ok_max_uncertainty_ms = 1.0;
+        config.quality.serve_degraded_max_uncertainty_ms = 5.0;
+        let state = create_test_state_with_config(Arc::new(config));
+        inject_sync_quality(&state, 100, 0); // uncertainty >> 5ms
+        let q = state.compute_quality();
+        assert_eq!(q.source, "holdover");
+        assert_eq!(q.serve_state, "holdover"); // 200 in default mode
+    }
+
+    // strict_sla_mode=true + uncertainty > degraded_max → always "stopped"
+    #[tokio::test]
+    async fn quality_beyond_degraded_max_stops_in_strict_mode() {
+        let mut config = crate::config::Config::default();
+        config.quality.strict_sla_mode = true;
         config.quality.allow_degraded = true;
         config.quality.serve_ok_max_uncertainty_ms = 1.0;
         config.quality.serve_degraded_max_uncertainty_ms = 5.0;
         let state = create_test_state_with_config(Arc::new(config));
-        // upstream_dispersion=100ms → uncertainty >> 5ms
         inject_sync_quality(&state, 100, 0);
         let q = state.compute_quality();
         assert_eq!(q.serve_state, "stopped");
     }
 
     #[tokio::test]
-    async fn quality_stale_downgrades_to_degraded() {
+    async fn quality_stale_becomes_holdover() {
         let mut config = crate::config::Config::default();
         config.ntp.max_staleness_secs = 5; // short threshold for test
         let state = create_test_state_with_config(Arc::new(config));
-        // age_secs=10 > max_staleness=5 → should be degraded even with low dispersion
+        // age_secs=10 > max_staleness=5 → holdover in default mode (stale but still serving)
         inject_sync_quality(&state, 0, 10);
         let q = state.compute_quality();
-        assert_eq!(q.source, "degraded");
+        assert_eq!(q.source, "holdover");
+        assert_eq!(q.serve_state, "holdover");
         assert_ne!(q.serve_state, "ok");
     }
 
     #[tokio::test]
     async fn time_handler_returns_503_when_serve_state_stopped() {
         let mut config = crate::config::Config::default();
+        config.quality.strict_sla_mode = true; // opt-in strict mode required for 503
         config.quality.serve_ok_max_uncertainty_ms = 1.0;
         config.quality.serve_degraded_max_uncertainty_ms = 5.0;
         let state = create_test_state_with_config(Arc::new(config));
@@ -793,6 +831,344 @@ mod tests {
         assert!(
             json.get("serve_state").is_none(),
             "/time body must not contain 'serve_state'"
+        );
+    }
+
+    // ── Holdover / default-mode behaviour ────────────────────────────────────
+
+    /// After seed, high uncertainty must return 200 (not 503) in default mode.
+    #[tokio::test]
+    async fn time_handler_returns_200_with_holdover_after_seed_by_default() {
+        use crate::ntp::SyncResult;
+        use crate::ntp::selection::TimingSource;
+        use axum::body::to_bytes;
+        let mut config = crate::config::Config::default();
+        // Tight thresholds so uncertainty is definitely above ok_max
+        config.quality.serve_ok_max_uncertainty_ms = 1.0;
+        config.quality.serve_degraded_max_uncertainty_ms = 2.0;
+        // strict_sla_mode=false (default) → holdover, not stopped
+        let state = create_test_state_with_config(Arc::new(config));
+        let sync_result = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "test:123".into(),
+            rtt: std::time::Duration::from_millis(5),
+            instant: std::time::Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 200, // >> 2ms
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&sync_result);
+        inject_sync_quality(&state, 200, 0);
+
+        let response = time_handler(State(state.clone()))
+            .await
+            .expect("expected 200 in default mode even with high uncertainty");
+        assert_eq!(response.status(), StatusCode::OK);
+        // serve_state header should be "holdover" not "stopped"
+        assert_eq!(response.headers()["x-time-serve-state"], "holdover");
+
+        let body = to_bytes(response.into_body(), 256).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], 200);
+        assert!(json["data"].as_i64().unwrap_or(0) > 0);
+    }
+
+    /// After seed, failed sync must NOT clear the TimeBase — the service keeps serving.
+    #[tokio::test]
+    async fn failed_sync_does_not_clear_timebase() {
+        use crate::ntp::SyncResult;
+        use crate::ntp::selection::TimingSource;
+        let state = create_test_state();
+        let sync_result = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "test:123".into(),
+            rtt: std::time::Duration::from_millis(5),
+            instant: std::time::Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 1,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&sync_result);
+        state.record_sync_success();
+
+        // Simulate repeated NTP failures — these must not clear the TimeBase
+        for _ in 0..5 {
+            state.record_sync_failure();
+        }
+
+        // TimeBase still returns Some after failures
+        assert!(state.timebase.has_synced());
+        assert!(state.timebase.now_ms().is_some());
+
+        // /time should still return 200
+        let response = time_handler(State(state.clone()))
+            .await
+            .expect("expected 200 after failures");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Monotonic output never goes backwards across calls.
+    #[tokio::test]
+    async fn monotonic_never_goes_backwards() {
+        use crate::ntp::SyncResult;
+        use crate::ntp::selection::TimingSource;
+        let state = create_test_state();
+        let sync_result = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "test:123".into(),
+            rtt: std::time::Duration::from_millis(5),
+            instant: std::time::Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 1,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&sync_result);
+        inject_sync_quality(&state, 1, 0);
+
+        let mut prev = 0i64;
+        for _ in 0..20 {
+            let ms = state.timebase.now_ms().unwrap();
+            assert!(ms >= prev, "time went backwards: {ms} < {prev}");
+            prev = ms;
+        }
+    }
+
+    /// Holdover state — TimeBase seeded by manual seed, no NTP quality available.
+    #[tokio::test]
+    async fn holdover_state_when_seeded_without_ntp_quality() {
+        use crate::ntp::SyncResult;
+        use crate::ntp::selection::TimingSource;
+        let state = create_test_state();
+        // Seed TimeBase directly (simulates persisted state load or manual seed)
+        // but do NOT populate last_sync_quality
+        let seed = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "persisted".into(),
+            rtt: std::time::Duration::ZERO,
+            instant: std::time::Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 0,
+            stratum: 2,
+            leap: 0,
+            precision_log2: 0,
+            reference_id: 0,
+            timing_source: TimingSource::Estimated,
+        };
+        state.timebase.update(&seed);
+        // last_sync_quality intentionally left as None
+
+        let q = state.compute_quality();
+        assert_eq!(q.source, "holdover");
+        assert_eq!(q.serve_state, "holdover");
+
+        // /time must return 200 (has_synced=true → now_ms=Some)
+        let response = time_handler(State(state)).await.expect("expected 200");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// After a good seed, repeated NTP sync failures must not affect service continuity.
+    #[tokio::test]
+    async fn timebase_continues_after_ntp_failures() {
+        use crate::ntp::SyncResult;
+        use crate::ntp::selection::TimingSource;
+        let state = create_test_state();
+        let seed = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "test:123".into(),
+            rtt: std::time::Duration::from_millis(5),
+            instant: std::time::Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 1,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&seed);
+        inject_sync_quality(&state, 1, 0);
+
+        // Simulate multiple NTP failures — do NOT call timebase.update() or clear quality
+        for _ in 0..5 {
+            state.record_sync_failure();
+        }
+
+        // TimeBase is still seeded; /time should return 200
+        let state_clone = state.clone();
+        let response = time_handler(State(state_clone))
+            .await
+            .expect("expected 200");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.timebase.has_synced());
+    }
+
+    /// Staleness grows with time: after seeding, staleness_ms reflects elapsed duration.
+    #[tokio::test]
+    async fn holdover_uncertainty_grows_with_age() {
+        use crate::ntp::selection::TimingSource;
+        use crate::ntp::{SyncQuality, SyncResult};
+        let state = create_test_state();
+        let seed = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "test:123".into(),
+            rtt: std::time::Duration::from_millis(5),
+            instant: std::time::Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 5,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&seed);
+        // Fake a sync that happened 200 s ago
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(200))
+            .unwrap_or_else(std::time::Instant::now);
+        *state.last_sync_quality.write() = Some(SyncQuality {
+            upstream_root_delay_ms: 10,
+            upstream_root_dispersion_ms: 5,
+            precision_log2: -10,
+            stratum: 2,
+            leap: 0,
+            measured_rtt_ms: 5,
+            jitter_ms: 0,
+            offset_ms: 1,
+            last_sync_instant: past,
+            selected_server: "ntp.test:123".into(),
+        });
+
+        let quality = state.compute_quality();
+        let staleness = quality.staleness_ms.expect("staleness must be Some");
+        // 200 seconds of age should give ≥ 190_000 ms staleness
+        assert!(
+            staleness >= 190_000,
+            "expected staleness ≥ 190 000 ms, got {staleness}"
+        );
+    }
+
+    /// Sync failure must not clear last_sync_quality (holdover keeps the good state).
+    #[tokio::test]
+    async fn worse_ntp_sample_does_not_replace_current_quality() {
+        use crate::ntp::SyncResult;
+        use crate::ntp::selection::TimingSource;
+        let state = create_test_state();
+        let seed = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "test:123".into(),
+            rtt: std::time::Duration::from_millis(5),
+            instant: std::time::Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 1,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&seed);
+        inject_sync_quality(&state, 1, 0);
+
+        // Sync failure path: record failure but do NOT update quality
+        state.record_sync_failure();
+
+        // Quality should still be the good snapshot
+        let quality_guard = state.last_sync_quality.read();
+        let quality = quality_guard
+            .as_ref()
+            .expect("quality should still be present");
+        assert!(
+            quality.compute_dispersion_ms() < 100.0,
+            "quality should still be the good snapshot"
+        );
+    }
+
+    /// Successful NTP sync updates last_sync_quality.
+    #[tokio::test]
+    async fn better_ntp_sample_updates_quality() {
+        use crate::ntp::SyncResult;
+        use crate::ntp::selection::TimingSource;
+        let state = create_test_state();
+        // Initially unsynced
+        assert!(state.last_sync_quality.read().is_none());
+
+        // Simulate successful sync
+        let result = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "test:123".into(),
+            rtt: std::time::Duration::from_millis(5),
+            instant: std::time::Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 2,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&result);
+        inject_sync_quality(&state, 2, 0);
+
+        let guard = state.last_sync_quality.read();
+        let quality = guard
+            .as_ref()
+            .expect("quality should be updated after sync");
+        assert!(
+            quality.compute_dispersion_ms() < 100.0,
+            "quality should reflect the new sync"
         );
     }
 

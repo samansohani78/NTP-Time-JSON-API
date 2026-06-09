@@ -13,6 +13,7 @@ use ntp_time_json_api::metrics::Metrics;
 use ntp_time_json_api::metrics::{RejectLabel, ReplicaLabel};
 use ntp_time_json_api::ntp::{NtpServer, NtpSyncer, SyncQuality};
 use ntp_time_json_api::performance;
+use ntp_time_json_api::persist;
 use ntp_time_json_api::timebase::TimeBase;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,54 @@ async fn main() -> anyhow::Result<()> {
         time_cache.clone(),
         perf_metrics.clone(),
     ));
+
+    // Load persisted state if enabled — seeds TimeBase so holdover works on restart
+    // when NTP is temporarily unavailable (internet down, DNS failure, etc.).
+    if config.persist.enabled {
+        match persist::load_state(&config.persist.file_path) {
+            Ok(Some(persisted)) => {
+                let now_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let elapsed_ms = now_unix_ms.saturating_sub(persisted.saved_at_unix_ms);
+                let effective_epoch_ms = persisted.saved_epoch_ms + elapsed_ms;
+                use ntp_time_json_api::ntp::{SyncResult, selection::TimingSource};
+                let seed = SyncResult {
+                    epoch_ms: effective_epoch_ms,
+                    server: persisted
+                        .selected_server
+                        .clone()
+                        .unwrap_or_else(|| "persisted".to_string()),
+                    rtt: Duration::ZERO,
+                    instant: std::time::Instant::now(),
+                    offset_ms: 0,
+                    t1_client_send_ms: effective_epoch_ms,
+                    t2_server_recv_ms: effective_epoch_ms,
+                    t3_server_send_ms: effective_epoch_ms,
+                    t4_client_recv_ms: effective_epoch_ms,
+                    root_delay_ms: 0,
+                    root_dispersion_ms: persisted.uncertainty_ms.unwrap_or(1000.0) as u32,
+                    stratum: 2,
+                    leap: 0,
+                    precision_log2: 0,
+                    reference_id: u32::from_be_bytes(*b"LOAD"),
+                    timing_source: TimingSource::Estimated,
+                };
+                timebase.update(&seed);
+                info!(
+                    saved_epoch_ms = persisted.saved_epoch_ms,
+                    elapsed_ms, effective_epoch_ms, "Seeded TimeBase from persisted state"
+                );
+            }
+            Ok(None) => {
+                info!("No persisted state file found, starting fresh");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to load persisted state, starting fresh");
+            }
+        }
+    }
 
     // Start background sync loop
     let sync_handle = tokio::spawn(sync_loop(
@@ -329,8 +378,9 @@ async fn sync_loop(
                 state.metrics.time_source_mode.set(match quality.source {
                     "ntp" => 0,
                     "degraded" => 1,
+                    "unsynced" => 2,
                     "manual" => 3,
-                    _ => 2, // "unsynced"
+                    _ => 4, // "holdover"
                 });
                 state
                     .metrics
@@ -339,7 +389,8 @@ async fn sync_loop(
                         "ok" => 0,
                         "degraded" => 1,
                         "stopped" => 2,
-                        _ => 3, // "unsynced"
+                        "unsynced" => 3,
+                        _ => 4, // "holdover"
                     });
 
                 // P1-8: replica drift visibility metrics
@@ -364,7 +415,8 @@ async fn sync_loop(
                         "ok" => 0,
                         "degraded" => 1,
                         "stopped" => 2,
-                        _ => 3,
+                        "unsynced" => 3,
+                        _ => 4, // "holdover"
                     });
                 state
                     .metrics
@@ -373,9 +425,35 @@ async fn sync_loop(
                     .set(match quality.source {
                         "ntp" => 0,
                         "degraded" => 1,
+                        "unsynced" => 2,
                         "manual" => 3,
-                        _ => 2,
+                        _ => 4, // "holdover"
                     });
+
+                // Persist last-good state if enabled
+                if config.persist.enabled {
+                    let now_unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    let persisted = persist::PersistedState {
+                        version: persist::PERSIST_VERSION,
+                        saved_epoch_ms: result.epoch_ms,
+                        saved_at_unix_ms: now_unix_ms,
+                        uncertainty_ms: quality.uncertainty_ms,
+                        source: "ntp".to_string(),
+                        selected_server: Some(result.server.clone()),
+                        selected_provider: None,
+                        last_successful_ntp_sync_unix_ms: Some(now_unix_ms),
+                    };
+                    if let Err(e) = persist::save_state(&config.persist.file_path, &persisted) {
+                        warn!(
+                            error = %e,
+                            path = %config.persist.file_path,
+                            "Failed to persist time state"
+                        );
+                    }
+                }
 
                 info!(
                     server = %result.server,
