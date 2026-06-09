@@ -4,12 +4,12 @@ Single source of truth for understanding the NTP Time JSON API project **as it e
 (current state, not future state).
 
 > **For financial / time-critical deployments, see `PRODUCTION_ACCURACY_PLAN.md`.** Current
-> limitations that make the service **not yet** suitable as an authoritative time source for
-> latency/correctness-sensitive systems: upstream `rsntp` yields **estimated (reconstructed) T2/T3**
-> rather than measured server timestamps; the UDP NTP server advertises **`root_dispersion = 0`**
-> (false certainty); there is **no time-quality / uncertainty envelope** and no serve/stop SLA;
-> there is **no secure manual-override** path; and there is **no full end-to-end CI**. These are
-> tracked as the P0/P1 roadmap in `PRODUCTION_ACCURACY_PLAN.md`.
+> limitations (P0-1/P0-2/P0-3/P0-4/P0-5 complete — T2/T3 and root fields measured from packet
+> bytes; UDP NTP server advertises honest `root_delay`/`root_dispersion` per RFC 5905 §11.2;
+> time-quality envelope, `/status`, `/time/full`, serve/stop policy, and quality headers live;
+> real E2E test harness and CI `e2e` job in place):
+> there is **no secure manual-override** path (P1-7).
+> This is tracked as the P1 roadmap in `PRODUCTION_ACCURACY_PLAN.md`.
 
 ---
 
@@ -22,9 +22,12 @@ also optionally acts as a **Stratum-2 UDP NTP server** for downstream clients. D
 Kubernetes with proper health probes and Prometheus metrics.
 
 **Readiness qualification.** This is suitable today as a general-purpose time API. It is **not yet
-financial/time-critical production ready** — that requires completing the P0 tasks in
-`PRODUCTION_ACCURACY_PLAN.md` (real measured T1–T4, honest `root_dispersion`, a time-quality
-envelope, and full E2E CI). The architecture described below is the **current state**.
+financial/time-critical production ready** — that requires completing P1-7 (manual override) and
+reviewing the P1 roadmap in `PRODUCTION_ACCURACY_PLAN.md`. P0-1 through P0-5 are complete: T1–T4
+are all measured, `rsntp` is removed, UDP NTP responses carry honest dispersion, the time-quality
+envelope (`/status`, `/time/full`, serve/stop policy, quality headers) is live, and a real E2E
+test harness runs in CI.
+The architecture described below is the **current state**.
 
 ---
 
@@ -34,7 +37,7 @@ envelope, and full E2E CI). The architecture described below is the **current st
 |---|---|
 | HTTP server | `axum 0.8` + `hyper 1.8` |
 | Async runtime | `tokio 1.48` (multi-thread) |
-| NTP client | `rsntp 4.1.1` (blocking, run in `spawn_blocking`) |
+| NTP client | `PacketNtpClient` (in-house async UDP; `src/ntp/client.rs`; reads measured T2/T3 + root fields from packet bytes; `rsntp` removed in P0-1/P0-2) |
 | Metrics | `prometheus-client 0.24.1` |
 | Lock-free state | `arc-swap 1.9`, `parking_lot 0.12`, `std::sync::atomic` |
 | Rate limiting | `tower_governor 0.8` |
@@ -72,7 +75,12 @@ envelope, and full E2E CI). The architecture described below is the **current st
 │       ├── sync.rs      NtpSyncer: parallel queries + sticky server selection
 │       └── server.rs    UDP NTP server (Stratum 2, responds to NTP clients)
 ├── tests/
-│   └── integration_api.rs  Placeholder integration tests (not real)
+│   ├── common/mod.rs        E2E test helpers (mock NTP, spawn server, UDP helpers)
+│   ├── e2e_http.rs          HTTP endpoint E2E tests (14 tests)
+│   ├── e2e_ntp_udp.rs       UDP NTP server E2E tests (3 tests)
+│   ├── e2e_websocket.rs     WebSocket streaming E2E tests (2 tests)
+│   ├── e2e_metrics.rs       Prometheus metrics scrape E2E tests (3 tests)
+│   └── integration_api.rs   Redirect comment → e2e_*.rs (placeholder removed)
 ├── k8s/
 │   ├── deployment.yaml  3 replicas, probes, resources, NET_BIND_SERVICE
 │   ├── service.yaml     ClusterIP, TCP:80→8080, UDP:123
@@ -101,7 +109,7 @@ flowchart TD
     C --> H[axum::serve HTTP:8080]
 
     D -->|every SYNC_INTERVAL secs| I[NtpSyncer::sync]
-    I --> J[Query all servers in parallel via rsntp]
+    I --> J[Query all servers in parallel via PacketNtpClient]
     J --> K[ServerSelector::select_best_result]
     K --> L[TimeBase::update]
     L --> M[AppState::record_sync_success]
@@ -164,10 +172,12 @@ Shared across all Axum handlers via `Arc<AppState>`. Cloned cheaply per request.
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/` | none | Alias for `/time` |
-| GET | `/time` | none | Returns NTP epoch_ms as JSON (fast path, no middleware) |
+| GET | `/time` | none | Returns NTP epoch_ms as JSON (fast path, no middleware); quality headers on 200 |
+| GET | `/time/full` | none | Enriched JSON with quality fields (slow router); same serve/stop policy as `/time` |
+| GET | `/status` | none | Always-200 quality envelope; read `serve_state` to know if `/time` would return 503 |
 | GET | `/stream` | none | WebSocket: streams tick messages at `WS_UPDATE_INTERVAL_MS` |
 | GET | `/healthz` | none | Liveness: always 200 |
-| GET | `/readyz` | none | Readiness: 503 before first sync (if `REQUIRE_SYNC=true`) |
+| GET | `/readyz` | none | Readiness: 503 before first sync; after first sync, 503 when `uncertainty_ms > READINESS_MAX_UNCERTAINTY_MS` (default 250 ms) |
 | GET | `/startupz` | none | Startup: 503 until first sync (if `REQUIRE_SYNC=true`) |
 | GET | `/metrics` | none | Prometheus text exposition |
 | GET | `/performance` | none | JSON: latency min/avg/max, cache hit rate, error rate, and `ntp_timing` (RFC 5905 T1-T4; null before first sync) |
@@ -206,7 +216,7 @@ Shared across all Axum handlers via `Arc<AppState>`. Cloned cheaply per request.
 ### Sync Flow
 
 1. **`NtpSyncer::sync()`** queries ALL configured servers in parallel (Tokio tasks).
-2. Each query uses `rsntp::SntpClient` (blocking, in `spawn_blocking`), wrapped with `tokio::time::timeout`.
+2. Each query uses `PacketNtpClient::query` (async UDP; `src/ntp/client.rs`) wrapped with `tokio::time::timeout`. T2/T3/root_delay/root_dispersion/precision are read directly from the NTP packet bytes — not reconstructed.
 3. Results collected → **`ServerSelector::select_best_result()`** runs outlier filtering.
 4. **Smart sticky**: switches server only if the new best is 50ms+ faster; otherwise keeps current server for stability.
 
@@ -220,10 +230,11 @@ Shared across all Axum handlers via `Arc<AppState>`. Cloned cheaply per request.
 
 ### RFC 5905 Four-Tuple
 
-Each `NtpResult` carries `T1..T4` (client send, server recv, server send, client recv). T2/T3 are derived since `rsntp` doesn't expose raw server timestamps:
-- `T2 = T1 + θ + δ/2`
-- `T3 = T4 + θ - δ/2`
+Each `NtpResult` carries `T1..T4` (client send, server recv, server send, client recv). All four are **measured** — T2 and T3 are read directly from the `receive_timestamp` and `transmit_timestamp` fields in the NTP server's reply packet:
+- `θ = ((T2−T1) + (T3−T4)) / 2`
+- `δ = (T4−T1) − (T3−T2)`
 - `epoch_ms = T4 + θ + OFFSET_BIAS_MS + ASYMMETRY_BIAS_MS`
+- `root_delay_ms`, `root_dispersion_ms`, `precision_log2`, `stratum`, `leap`, `reference_id` all read from packet bytes and surfaced on `/performance` as `timing_source:"measured"`.
 
 ### UDP NTP Server (`src/ntp/server.rs`)
 
@@ -331,12 +342,26 @@ Every source module has tests:
 - `ntp/sync.rs`: syncer creation; `sticky_select` pure function (6 tests covering all decision paths)
 - `ntp/server.rs`: synced/unsynced response via real UDP loopback; `root_delay` propagation; `UdpRateLimiter` (4 tests)
 
-### Integration tests (`tests/integration_api.rs` and `src/http/mod.rs`)
-`tests/integration_api.rs` is a documentation placeholder — because the crate has no `lib.rs`, external tests cannot import internal types. The real integration tests live in `src/http/mod.rs` as inline `#[cfg(test)]` tests with access to all internal types. They cover:
+### Integration tests (`src/http/mod.rs`)
+Inline `#[cfg(test)]` tests with access to all internal types. They cover:
 - 503 before first sync for `/time`, `/readyz`, `/startupz`
 - Full end-to-end: mock UDP NTP server → `NtpSyncer::sync()` → `/time` 200 with correct epoch
 - Probe 200 after sync, monotonic time progression
 - `/metrics` and `/performance` endpoint shape
+
+### E2E tests (`tests/e2e_*.rs`) — P0-5
+Added in P0-5. `src/lib.rs` exposes all modules so `tests/` can import them. Each test binary
+spawns an in-process HTTP/UDP server on a random port using a mock upstream NTP server; no live
+network required.
+
+| Binary | Tests | Coverage |
+|---|---|---|
+| `e2e_http.rs` | 14 | `/time`, `/time/full`, `/status`, `/readyz`, `/startupz`, `/healthz`, `/performance`; pre/post sync; quality headers |
+| `e2e_ntp_udp.rs` | 3 | Synced/unsynced UDP NTP server responses; origin timestamp echo; RFC 5905 fields |
+| `e2e_websocket.rs` | 2 | Welcome + tick messages; monotonic `epoch_ms` |
+| `e2e_metrics.rs` | 3 | Core, quality-envelope, and UDP-server Prometheus families |
+
+Run with `make e2e` (or `cargo test --test e2e_http --test e2e_ntp_udp --test e2e_websocket --test e2e_metrics`).
 
 ### External scripts
 - `test_api.sh` — bash script testing all HTTP endpoints against a running service
@@ -346,10 +371,11 @@ Every source module has tests:
 
 ### Running tests
 ```bash
-cargo test                    # all unit + integration tests
+cargo test                    # all unit + integration + E2E tests
 cargo test <test_name>        # single test
 cargo test -- --nocapture     # with stdout
-make ci                       # fmt-check + clippy + test
+make e2e                      # E2E tests only (HTTP + UDP + WebSocket + metrics)
+make ci                       # fmt-check + clippy + test (all)
 ```
 
 ---
@@ -377,10 +403,11 @@ Build is multi-stage: builder (`rust:1.92-bookworm`), runtime (`distroless/cc-de
 Jobs (all on `ubuntu-latest`):
 1. `fmt` — `cargo fmt --all -- --check`
 2. `clippy` — `cargo clippy --all-targets --all-features -- -D warnings`
-3. `test` — `cargo test --all-features --verbose`
-4. `build` — `cargo build --release`, uploads binary artifact (7 day retention)
-5. `security-audit` — `cargo audit`
-6. `docker` — Docker build + Trivy CRITICAL/HIGH scan (main branch only, after other jobs)
+3. `test` — `cargo test --all-features --verbose` (unit + inline integration + all E2E)
+4. `e2e` — `make e2e` (explicit E2E job; runs after `test`)
+5. `build` — `cargo build --release`, uploads binary artifact (7 day retention)
+6. `security-audit` — `cargo audit`
+7. `docker` — Docker build + Trivy CRITICAL/HIGH scan (main branch only, after all jobs including `e2e`)
 
 Docker push is **commented out** — not publishing to any registry.
 
@@ -389,10 +416,68 @@ Docker push is **commented out** — not publishing to any registry.
 kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/deployment.yaml
 kubectl apply -f k8s/service.yaml
-kubectl apply -f k8s/servicemonitor.yaml  # optional, Prometheus Operator
+kubectl apply -f k8s/servicemonitor.yaml      # optional, Prometheus Operator
+kubectl apply -f k8s/prometheus-rules.yaml    # optional, Prometheus alerting rules (P1-8)
 ```
 
 Deployment: 3 replicas, `NET_BIND_SERVICE` capability (for UDP 123), startup probe polls `/startupz` up to 30 times × 2s = 60s for first sync.
+
+### Replica Drift Visibility (P1-8)
+
+This service is stateless and share-nothing across replicas — there is **no gossip, no consensus, and no cross-replica coordination**. Instead, each replica exposes its own state; Prometheus aggregates across replicas to detect drift.
+
+**Per-replica identity:** `REPLICA_ID` env var (default: `HOSTNAME`, then `replica-<pid>`). In Kubernetes, set via downward API (`metadata.name`) so each pod has a unique ID.
+
+**Per-replica fields in `/status` and `/time/full`:**
+- `replica_id` — which pod answered this request
+- `selected_offset_ms` — NTP offset from last sync
+- `combined_uncertainty_ms` — uncertainty after provider-cap inflation
+- `selected_provider` — last 2 DNS labels of the selected NTP server
+- `selection_state` — `ok` / `no_quorum` / `no_candidates`
+
+**Per-replica Prometheus metrics (all labeled `{replica_id="..."}`):**
+- `time_replica_offset_milliseconds` — offset in ms (spread across replicas detects drift)
+- `time_replica_uncertainty_milliseconds` — combined uncertainty in ms
+- `time_replica_serve_state` — 0=ok, 1=degraded, 2=stopped, 3=unsynced
+- `time_replica_source_mode` — 0=ntp, 1=degraded, 2=unsynced, 3=manual
+
+**Alerting (`k8s/prometheus-rules.yaml`):**
+- `NtpTimeReplicaHighUncertainty` — uncertainty > 250 ms for 5 min
+- `NtpTimeReplicaStopped` — serve_state > 1 for 2 min
+- `NtpTimeReplicaSpreadHigh` — `max - min` offset across replicas > 100 ms for 5 min
+- `NtpTimeSingleProvider` — single NTP provider dominates for 10 min
+
+### Interval-Intersection Selection (P1F-12)
+
+Before the weighted-median step, a **Marzullo sweep** (RFC 5905 §11.2.1) pre-filters candidates into truechimers and falsetickers.
+
+**Algorithm:**
+1. For each candidate with offset θ and lambda λ, create the interval `[θ−λ, θ+λ]`.
+2. Build sweep events (+1=open, −1=close). Sort ascending; opens before closes at ties.
+3. Sweep to find "significant clusters" — contiguous regions where the overlap depth ≥ `min_quorum`.
+4. If 0 clusters → `NoIntersection` (fail closed). If ≥ 2 clusters → `AmbiguousCluster` (fail closed). If exactly 1 cluster → truechimers are candidates whose intervals span `[peak_lo, peak_hi]`.
+5. Weighted median runs on truechimers only.
+
+**Combined uncertainty formula:** `max(best.lambda, intersection_radius)` then ×2 if single_provider.
+
+**Fail-closed semantics:**
+- `NoIntersection`: no consensus region → `SelectionState::NoIntersection`, no time served.
+- `AmbiguousCluster`: multiple competing clusters (independently-wrong majority) → `SelectionState::AmbiguousCluster`, no time served.
+- This prevents silent wrong selection when a majority of servers agree on a wrong offset.
+
+**Config:** `NTP_INTERVAL_SELECTION_ENABLED` (default `true`). Set to `false` to fall back to P1-6 weighted-median only (not recommended in production).
+
+**Diagnostics:** `IntersectionDiagnostics` struct exposed under `"intersection"` key in `/status` and `/time/full`:
+- `enabled`, `state` (`ok`/`no_intersection`/`ambiguous_cluster`/`insufficient_quorum`/`disabled`)
+- `intersection_low_ms`, `intersection_high_ms`, `intersection_width_ms`
+- `truechimer_count`, `falseticker_count`, `competing_cluster_count`
+
+**Prometheus metrics:**
+- `ntp_intersection_truechimers` — gauge: count of truechimers after sweep
+- `ntp_intersection_falsetickers_total` — counter: cumulative falseticker count
+- `ntp_intersection_width_milliseconds` — gauge: intersection width in ms
+- `ntp_intersection_failures_total{reason}` — counter: failures by reason (`no_intersection`, `ambiguous_cluster`)
+- `ntp_intersection_ambiguous_clusters` — gauge: competing cluster count
 
 ---
 
@@ -429,8 +514,13 @@ Test-only methods are in `#[cfg(test)]` impl blocks (not `#[allow(dead_code)]`):
 ### 1. Only one `SelectionStrategy` variant
 `config.rs` defines `SelectionStrategy::AccuracyFirst` as the only variant (env-var value `"rtt_min"` or `"accuracy_first"`). Any other string is a hard startup failure. The algorithm is accuracy-first (closest to consensus offset), with RTT as tiebreaker.
 
-### 2. UDP NTP server `root_dispersion=0`
-`root_delay` is propagated from the last upstream NTP sync RTT (via `last_rtt_ms: Arc<AtomicU64>` in `AppState`). Verified live: a 538ms upstream RTT produces `root_delay = 0x000089ba` in NTP short format. `root_dispersion` remains 0 (upstream dispersion is not tracked). RFC 5905 clients may underestimate uncertainty slightly.
+### 2. ~~UDP NTP server `root_dispersion=0`~~ — fixed (P0-3)
+UDP replies now carry honest `root_delay` and `root_dispersion` sourced from `AppState::last_sync_quality` (populated each sync by P0-2). Formula (RFC 5905 §11.2):
+- `root_delay = upstream.root_delay + local_RTT` (NTP short format, via `ms_to_ntp_short`)
+- `root_dispersion = upstream.root_dispersion + |precision| + jitter + PHI×age×1000 + RTT/2`
+  where PHI = 15 µs/s (RFC 5905 MAX_DRIFT), computed in f64 for sub-ms precision, clamped to `NTP_SERVER_MAX_ROOT_DISPERSION_MS` (default 16 000 ms = RFC 5905 MAX_DISPERSION).
+- New Prometheus gauge: `ntp_udp_server_root_dispersion_seconds` (last-advertised value).
+- Unsynced behavior unchanged: LI=3, Stratum=16, root_delay=0, root_dispersion=0.
 
 ### 3. Docker Compose healthcheck is `NONE`
 Distroless has no shell/wget. The container has no health check in compose. Only Kubernetes probes work.

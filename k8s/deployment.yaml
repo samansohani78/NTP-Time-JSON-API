@@ -36,6 +36,10 @@ spec:
           containerPort: 123
           protocol: UDP
         env:
+        - name: REPLICA_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: ADDR
           value: "0.0.0.0:8080"
         - name: LOG_LEVEL

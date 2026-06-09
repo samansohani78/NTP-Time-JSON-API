@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -8,9 +9,72 @@ pub struct Config {
     pub http: HttpConfig,
     pub ntp: NtpConfig,
     pub ntp_server: NtpServerConfig,
+    pub quality: QualityConfig,
     pub ws: WsConfig,
     pub logging: LoggingConfig,
     pub messages: MessageConfig,
+    pub admin: AdminConfig,
+    pub replica: ReplicaConfig,
+}
+
+/// P1-8 replica identity configuration.
+///
+/// `replica_id` is the unique label for this process instance.
+/// It is stamped on replica-specific Prometheus metrics so operators
+/// can detect inter-replica drift via alerting rules.
+///
+/// Resolution order:
+/// 1. `REPLICA_ID` env var (explicit)
+/// 2. `HOSTNAME` env var (set automatically inside a Kubernetes pod)
+/// 3. `replica-<pid>` (process-local fallback)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaConfig {
+    /// Non-empty, max 128 characters.
+    pub replica_id: String,
+}
+
+/// Configuration for the optional admin API (P1-7 secure manual time override).
+///
+/// All admin endpoints are only registered when `enabled = true`.
+/// Enabling without setting `token` is a startup error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    /// Whether the admin API is enabled. Default: false.
+    pub enabled: bool,
+    /// Bearer token required for all admin endpoints.
+    /// Must be non-empty when `enabled = true`. Never logged.
+    pub token: String,
+    /// Maximum TTL (seconds) for a manual time override. Default: 300.
+    pub max_ttl_secs: u32,
+    /// Maximum epoch_ms jump (ms) allowed from current NTP time. Default: 5000.
+    pub max_jump_ms: u64,
+    /// Whether `force=true` in POST /admin/time/override is allowed.
+    /// Set via `MANUAL_OVERRIDE_ALLOW_FORCE=true`. Default: false.
+    /// When false, any request with `force=true` is rejected 400.
+    /// When true, `force=true` bypasses the jump check (monotonic clamp still applies).
+    pub allow_force: bool,
+    /// Base root_dispersion (ms) advertised by the UDP NTP server in MANU mode. Default: 1000.
+    pub dispersion_ms: u64,
+}
+
+/// Serve/stop SLA thresholds for the time-quality envelope (P0-4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityConfig {
+    /// When false (default), any uncertainty above `serve_ok_max_uncertainty_ms`
+    /// causes `serve_state="stopped"` and a 503 response. When true, uncertainty
+    /// up to `serve_degraded_max_uncertainty_ms` returns 200 with
+    /// `source="degraded"`. Uncertainty beyond the degraded max always stops.
+    pub allow_degraded: bool,
+    /// Max uncertainty (ms) to report `serve_state="ok"`.
+    /// Default 50 ms. Must be strictly less than `serve_degraded_max_uncertainty_ms`.
+    pub serve_ok_max_uncertainty_ms: f64,
+    /// Max uncertainty (ms) to serve at all (when `ALLOW_DEGRADED=true`).
+    /// Uncertainty above this always returns 503 regardless of `allow_degraded`.
+    /// Default 250 ms.
+    pub serve_degraded_max_uncertainty_ms: f64,
+    /// Max uncertainty (ms) for `/readyz` to return 200 after first sync.
+    /// Default 250 ms (matches `serve_degraded_max_uncertainty_ms`).
+    pub readiness_max_uncertainty_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,27 +99,74 @@ pub struct NtpConfig {
     pub probe_max_interval_secs: u64,
     pub max_staleness_secs: u64,
     pub require_sync: bool,
+    /// Deprecated: accepted for backwards compat but has no effect since P1-6.
     pub selection_strategy: SelectionStrategy,
-    pub max_offset_skew_ms: i64,
     pub monotonic_output: bool,
     pub offset_bias_ms: i64,
     pub asymmetry_bias_ms: i64,
     pub max_consecutive_failures: u32,
+    /// P1-6 uncertainty-aware weighted-median selection configuration.
+    pub selection: SelectionConfig,
 }
 
 /// NTP server selection strategy.
 ///
-/// Only one strategy is currently implemented. The env-var value
-/// `"rtt_min"` is kept for backwards compatibility even though the
-/// actual algorithm is accuracy-first (closest to median offset),
-/// using RTT only as a tiebreaker.
+/// **Deprecated** — kept for backwards-compatible env-var parsing only.
+/// P1-6 replaced the algorithm with uncertainty-aware weighted median + quorum;
+/// the `SELECTION_STRATEGY` env var is accepted but has no effect.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionStrategy {
-    /// Accuracy-first: select the server closest to the consensus
-    /// (median) offset. RTT is used only as a tiebreaker. Accepted
-    /// env-var value: `"rtt_min"` (historical; preserved for compat).
+    /// Historical alias for the old accuracy-first algorithm.
+    /// Accepted for backwards compat; ignored by the P1-6 selection.
     AccuracyFirst,
+}
+
+/// Configuration for the P1-6 uncertainty-aware weighted-median NTP selection
+/// algorithm.  All fields are read from environment variables at startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionConfig {
+    /// Maximum upstream stratum accepted (hard gate). Default: 4.
+    pub max_stratum: u8,
+    /// Minimum number of agreeing servers required for a valid selection.
+    /// A production deployment should use ≥ 2 NTP sources. Default: 2.
+    pub min_quorum: usize,
+    /// Hard-gate samples with `leap = 3` (LI_ALARM / unsynchronised). Default: true.
+    pub reject_leap_alarm: bool,
+    /// Hard-gate samples whose root-distance λ exceeds this (ms). Default: 500.0.
+    pub max_root_distance_ms: f64,
+    /// Hard-gate samples older than this (seconds). Default: 60 (= 2 × default sync interval).
+    pub max_sample_age_secs: u64,
+    /// Provider-group cap: if one provider group holds more than this fraction
+    /// of the agreers, `single_provider=true` and uncertainty is doubled. Default: 0.5.
+    pub provider_group_max_fraction: f64,
+    /// Optional per-server provider-group overrides.
+    /// Format: `"server1=group1,server2=group2"` via `NTP_PROVIDER_GROUPS`.
+    pub provider_groups: HashMap<String, String>,
+    /// Maximum offset deviation from the weighted median for a server to be
+    /// considered an agreer.  Moved from `NtpConfig` for P1-6.  Default: 1000 ms.
+    pub max_offset_skew_ms: i64,
+    /// P1F-12: enable Marzullo/interval-intersection pre-filter before the weighted
+    /// median step.  When true, candidates whose uncertainty intervals do not
+    /// participate in the maximum-overlap cluster are rejected as falsetickers.
+    /// Default: true.  Set `NTP_INTERVAL_SELECTION_ENABLED=false` to disable.
+    pub interval_selection_enabled: bool,
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        Self {
+            max_stratum: 4,
+            min_quorum: 2,
+            reject_leap_alarm: true,
+            max_root_distance_ms: 500.0,
+            max_sample_age_secs: 60,
+            provider_group_max_fraction: 0.5,
+            provider_groups: HashMap::new(),
+            max_offset_skew_ms: 1000,
+            interval_selection_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +178,11 @@ pub struct NtpServerConfig {
     pub addr: SocketAddr,
     /// Maximum packet size we will accept from a client.
     pub max_packet_size: usize,
+    /// Hard ceiling on the `root_dispersion` we will ever advertise to
+    /// downstream NTP clients (milliseconds). RFC 5905 §7.1 caps
+    /// MAX_DISPERSION at 16 seconds; 16000 is the conservative default.
+    /// Set `NTP_SERVER_MAX_ROOT_DISPERSION_MS` to override.
+    pub max_root_dispersion_ms: u64,
 }
 
 /// WebSocket configuration. Read once at startup; the per-connection
@@ -105,6 +221,16 @@ pub struct MessageConfig {
     pub error_no_sync: String,
     pub error_internal: String,
     pub error_timeout: String,
+}
+
+/// Resolve the replica ID using the priority chain:
+/// `REPLICA_ID` → `HOSTNAME` → `replica-<pid>`.
+pub(crate) fn resolve_replica_id() -> String {
+    std::env::var("REPLICA_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| format!("replica-{}", std::process::id()))
 }
 
 fn env_or_default(key: &str, default: &str) -> String {
@@ -172,6 +298,8 @@ impl Config {
             .context("Failed to parse NTP_SERVER_ADDR")?;
         let ntp_server_max_packet_size =
             env_or_parse("NTP_SERVER_MAX_PACKET_SIZE", 1024usize).max(48);
+        let ntp_server_max_root_dispersion_ms =
+            env_or_parse("NTP_SERVER_MAX_ROOT_DISPERSION_MS", 16_000u64);
 
         // WebSocket config. 0 / unparseable falls back to the default.
         // We apply the .filter(|&ms| ms > 0) guard here so the
@@ -195,7 +323,32 @@ impl Config {
             other => anyhow::bail!("Invalid SELECTION_STRATEGY: {}", other),
         };
 
-        let max_offset_skew_ms = env_or_parse("MAX_OFFSET_SKEW_MS", 1000);
+        // P1-6 selection config
+        let sel_max_stratum = env_or_parse("MAX_STRATUM", 4u8);
+        let sel_min_quorum = env_or_parse("MIN_QUORUM", 2usize);
+        let sel_reject_leap_alarm = env_or_parse("REJECT_LEAP_ALARM", true);
+        let sel_max_root_distance_ms = env_or_parse("MAX_ROOT_DISTANCE_MS", 500.0f64);
+        let sel_max_sample_age_secs = env_or_parse("MAX_SAMPLE_AGE_SECS", 60u64);
+        let sel_provider_group_max_fraction = env_or_parse("PROVIDER_GROUP_MAX_FRACTION", 0.5f64);
+        let sel_provider_groups: HashMap<String, String> = {
+            let raw = env_or_default("NTP_PROVIDER_GROUPS", "");
+            raw.split(',')
+                .filter(|s| s.contains('='))
+                .filter_map(|s| {
+                    let mut parts = s.splitn(2, '=');
+                    let k = parts.next()?.trim().to_string();
+                    let v = parts.next()?.trim().to_string();
+                    if k.is_empty() || v.is_empty() {
+                        None
+                    } else {
+                        Some((k, v))
+                    }
+                })
+                .collect()
+        };
+        let sel_max_offset_skew_ms = env_or_parse("MAX_OFFSET_SKEW_MS", 1000i64);
+        let sel_interval_selection_enabled = env_or_parse("NTP_INTERVAL_SELECTION_ENABLED", true);
+
         let monotonic_output = env_or_parse("MONOTONIC_OUTPUT", true);
         let offset_bias_ms = env_or_parse("OFFSET_BIAS_MS", 0);
         let asymmetry_bias_ms = env_or_parse("ASYMMETRY_BIAS_MS", 0);
@@ -211,6 +364,24 @@ impl Config {
         );
         let error_internal = env_or_default("ERROR_TEXT_INTERNAL", "Internal server error");
         let error_timeout = env_or_default("ERROR_TEXT_TIMEOUT", "Request timeout");
+
+        // Quality / SLA config
+        let allow_degraded = env_or_parse("ALLOW_DEGRADED", false);
+        let serve_ok_max_uncertainty_ms = env_or_parse("SERVE_OK_MAX_UNCERTAINTY_MS", 50.0f64);
+        let serve_degraded_max_uncertainty_ms =
+            env_or_parse("SERVE_DEGRADED_MAX_UNCERTAINTY_MS", 250.0f64);
+        let readiness_max_uncertainty_ms = env_or_parse("READINESS_MAX_UNCERTAINTY_MS", 250.0f64);
+
+        // P1-8: replica identity
+        let replica_id = resolve_replica_id();
+
+        // Admin API config (P1-7)
+        let admin_enabled = env_or_parse("ADMIN_API_ENABLED", false);
+        let admin_token = env_or_default("ADMIN_API_TOKEN", "");
+        let admin_max_ttl_secs = env_or_parse("MANUAL_OVERRIDE_MAX_TTL_SECS", 300u32);
+        let admin_max_jump_ms = env_or_parse("MANUAL_OVERRIDE_MAX_JUMP_MS", 5000u64);
+        let admin_dispersion_ms = env_or_parse("MANUAL_OVERRIDE_DISPERSION_MS", 1000u64);
+        let admin_allow_force = env_or_parse("MANUAL_OVERRIDE_ALLOW_FORCE", false);
 
         let config = Config {
             http: HttpConfig {
@@ -230,16 +401,33 @@ impl Config {
                 max_staleness_secs,
                 require_sync,
                 selection_strategy,
-                max_offset_skew_ms,
                 monotonic_output,
                 offset_bias_ms,
                 asymmetry_bias_ms,
                 max_consecutive_failures,
+                selection: SelectionConfig {
+                    max_stratum: sel_max_stratum,
+                    min_quorum: sel_min_quorum,
+                    reject_leap_alarm: sel_reject_leap_alarm,
+                    max_root_distance_ms: sel_max_root_distance_ms,
+                    max_sample_age_secs: sel_max_sample_age_secs,
+                    provider_group_max_fraction: sel_provider_group_max_fraction,
+                    provider_groups: sel_provider_groups,
+                    max_offset_skew_ms: sel_max_offset_skew_ms,
+                    interval_selection_enabled: sel_interval_selection_enabled,
+                },
             },
             ntp_server: NtpServerConfig {
                 enabled: ntp_server_enabled,
                 addr: ntp_server_addr,
                 max_packet_size: ntp_server_max_packet_size,
+                max_root_dispersion_ms: ntp_server_max_root_dispersion_ms,
+            },
+            quality: QualityConfig {
+                allow_degraded,
+                serve_ok_max_uncertainty_ms,
+                serve_degraded_max_uncertainty_ms,
+                readiness_max_uncertainty_ms,
             },
             ws: WsConfig {
                 update_interval_ms: ws_update_interval_ms,
@@ -254,6 +442,15 @@ impl Config {
                 error_internal,
                 error_timeout,
             },
+            admin: AdminConfig {
+                enabled: admin_enabled,
+                token: admin_token,
+                max_ttl_secs: admin_max_ttl_secs,
+                max_jump_ms: admin_max_jump_ms,
+                allow_force: admin_allow_force,
+                dispersion_ms: admin_dispersion_ms,
+            },
+            replica: ReplicaConfig { replica_id },
         };
 
         config.validate()?;
@@ -276,8 +473,52 @@ impl Config {
         if self.ntp_server.max_packet_size < 48 {
             anyhow::bail!("NTP_SERVER_MAX_PACKET_SIZE must be at least 48");
         }
+        if self.ntp_server.max_root_dispersion_ms == 0 {
+            anyhow::bail!("NTP_SERVER_MAX_ROOT_DISPERSION_MS must be > 0");
+        }
         if self.ws.update_interval_ms == 0 {
             anyhow::bail!("WS_UPDATE_INTERVAL_MS must be at least 1 ms");
+        }
+        if self.quality.serve_ok_max_uncertainty_ms <= 0.0 {
+            anyhow::bail!("SERVE_OK_MAX_UNCERTAINTY_MS must be > 0");
+        }
+        if self.quality.serve_ok_max_uncertainty_ms
+            >= self.quality.serve_degraded_max_uncertainty_ms
+        {
+            anyhow::bail!(
+                "SERVE_OK_MAX_UNCERTAINTY_MS must be less than SERVE_DEGRADED_MAX_UNCERTAINTY_MS"
+            );
+        }
+        if self.admin.enabled && self.admin.token.is_empty() {
+            anyhow::bail!("ADMIN_API_TOKEN must be set when ADMIN_API_ENABLED=true");
+        }
+        if self.admin.enabled && self.admin.max_ttl_secs == 0 {
+            anyhow::bail!("MANUAL_OVERRIDE_MAX_TTL_SECS must be > 0");
+        }
+        if self.admin.enabled && self.admin.dispersion_ms == 0 {
+            anyhow::bail!("MANUAL_OVERRIDE_DISPERSION_MS must be > 0");
+        }
+        if self.replica.replica_id.is_empty() {
+            anyhow::bail!("REPLICA_ID must not be empty");
+        }
+        if self.replica.replica_id.len() > 128 {
+            anyhow::bail!("REPLICA_ID must be 128 characters or fewer");
+        }
+        let sel = &self.ntp.selection;
+        if sel.max_stratum == 0 {
+            anyhow::bail!("MAX_STRATUM must be >= 1");
+        }
+        if sel.min_quorum == 0 {
+            anyhow::bail!("MIN_QUORUM must be >= 1");
+        }
+        if sel.max_root_distance_ms <= 0.0 {
+            anyhow::bail!("MAX_ROOT_DISTANCE_MS must be > 0");
+        }
+        if sel.max_sample_age_secs == 0 {
+            anyhow::bail!("MAX_SAMPLE_AGE_SECS must be > 0");
+        }
+        if sel.provider_group_max_fraction <= 0.0 || sel.provider_group_max_fraction > 1.0 {
+            anyhow::bail!("PROVIDER_GROUP_MAX_FRACTION must be in (0, 1]");
         }
         Ok(())
     }
@@ -291,8 +532,6 @@ impl Config {
     }
 }
 
-// For tests only
-#[cfg(test)]
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -313,16 +552,23 @@ impl Default for Config {
                 max_staleness_secs: 120,
                 require_sync: true,
                 selection_strategy: SelectionStrategy::AccuracyFirst,
-                max_offset_skew_ms: 1000,
                 monotonic_output: true,
                 offset_bias_ms: 0,
                 asymmetry_bias_ms: 0,
                 max_consecutive_failures: 10,
+                selection: SelectionConfig::default(),
             },
             ntp_server: NtpServerConfig {
                 enabled: false,
                 addr: "0.0.0.0:123".parse().unwrap(),
                 max_packet_size: 1024,
+                max_root_dispersion_ms: 16_000,
+            },
+            quality: QualityConfig {
+                allow_degraded: false,
+                serve_ok_max_uncertainty_ms: 50.0,
+                serve_degraded_max_uncertainty_ms: 250.0,
+                readiness_max_uncertainty_ms: 250.0,
             },
             ws: WsConfig {
                 update_interval_ms: 1000,
@@ -339,6 +585,17 @@ impl Default for Config {
                 error_no_sync: "Service not yet synchronized with NTP".to_string(),
                 error_internal: "Internal server error".to_string(),
                 error_timeout: "Request timeout".to_string(),
+            },
+            admin: AdminConfig {
+                enabled: false,
+                token: String::new(),
+                max_ttl_secs: 300,
+                max_jump_ms: 5000,
+                allow_force: false,
+                dispersion_ms: 1000,
+            },
+            replica: ReplicaConfig {
+                replica_id: format!("replica-{}", std::process::id()),
             },
         }
     }
@@ -382,6 +639,55 @@ mod tests {
         config.ntp.probe_max_interval_secs = 20;
         config.ws.update_interval_ms = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_replica_id_from_explicit_env() {
+        let saved = std::env::var("REPLICA_ID").ok();
+        unsafe {
+            std::env::set_var("REPLICA_ID", "my-explicit-replica");
+        }
+        let id = resolve_replica_id();
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("REPLICA_ID", v),
+                None => std::env::remove_var("REPLICA_ID"),
+            }
+        }
+        assert_eq!(id, "my-explicit-replica");
+    }
+
+    #[test]
+    fn test_replica_id_defaults_from_hostname() {
+        // Save current state so we can restore after the test.
+        let saved_rid = std::env::var("REPLICA_ID").ok();
+        let saved_host = std::env::var("HOSTNAME").ok();
+        unsafe {
+            std::env::remove_var("REPLICA_ID");
+            std::env::set_var("HOSTNAME", "ntp-pod-abc123");
+        }
+        let id = resolve_replica_id();
+        // Restore before asserting (cleanup even on failure via unwind).
+        unsafe {
+            match saved_rid {
+                Some(v) => std::env::set_var("REPLICA_ID", v),
+                None => std::env::remove_var("REPLICA_ID"),
+            }
+            match saved_host {
+                Some(v) => std::env::set_var("HOSTNAME", v),
+                None => std::env::remove_var("HOSTNAME"),
+            }
+        }
+        assert_eq!(id, "ntp-pod-abc123");
+    }
+
+    #[test]
+    fn test_replica_id_too_long_fails_validation() {
+        let mut config = Config::default();
+        config.replica.replica_id = "x".repeat(129);
+        assert!(config.validate().is_err());
+        config.replica.replica_id = "x".repeat(128);
+        assert!(config.validate().is_ok());
     }
 
     #[test]

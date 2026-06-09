@@ -18,6 +18,16 @@ pub enum AppError {
     #[error("NTP sync not yet completed: {error}")]
     NotSynced { message: String, error: String },
 
+    /// Service is synced but time uncertainty exceeds the configured SLA
+    /// threshold and `ALLOW_DEGRADED=false`. The serve/stop policy (P0-4)
+    /// prevents serving time that is too uncertain.
+    #[error("Service stopped due to excessive time uncertainty: {error}")]
+    ServeStopped {
+        message: String,
+        error: String,
+        serve_state: String,
+    },
+
     /// Unexpected internal error. Wraps `anyhow::Error` so handlers
     /// can use `?` on any error type implementing
     /// `std::error::Error + Send + Sync + 'static`.
@@ -27,24 +37,39 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message, error): (StatusCode, String, String) = match self {
+        match self {
             AppError::NotSynced { message, error } => {
-                (StatusCode::SERVICE_UNAVAILABLE, message, error)
+                let body = Json(json!({
+                    "message": message,
+                    "status": 503,
+                    "data": 0,
+                    "error": error,
+                }));
+                (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
             }
-            AppError::Internal(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "error".to_string(),
-                "Internal server error".to_string(),
-            ),
-        };
-
-        let body = Json(json!({
-            "message": message,
-            "status": status.as_u16(),
-            "data": 0,
-            "error": error,
-        }));
-
-        (status, body).into_response()
+            AppError::ServeStopped {
+                message,
+                error,
+                serve_state,
+            } => {
+                let body = Json(json!({
+                    "message": message,
+                    "status": 503,
+                    "data": 0,
+                    "error": error,
+                    "serve_state": serve_state,
+                }));
+                (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+            }
+            AppError::Internal(_) => {
+                let body = Json(json!({
+                    "message": "error",
+                    "status": 500,
+                    "data": 0,
+                    "error": "Internal server error",
+                }));
+                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+            }
+        }
     }
 }

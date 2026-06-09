@@ -1,11 +1,3 @@
-mod config;
-mod errors;
-mod http;
-mod metrics;
-mod ntp;
-mod performance;
-mod timebase;
-
 // PERFORMANCE: Use jemalloc for 10-20% throughput improvement
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -14,13 +6,16 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-use config::Config;
-use http::state::{AppState, NtpTimingSummary};
-use metrics::Metrics;
-use ntp::{NtpServer, NtpSyncer};
+use ntp_time_json_api::config::{Config, LogFormat};
+use ntp_time_json_api::http;
+use ntp_time_json_api::http::state::{AppState, NtpTimingSummary};
+use ntp_time_json_api::metrics::Metrics;
+use ntp_time_json_api::metrics::{RejectLabel, ReplicaLabel};
+use ntp_time_json_api::ntp::{NtpServer, NtpSyncer, SyncQuality};
+use ntp_time_json_api::performance;
+use ntp_time_json_api::timebase::TimeBase;
 use std::sync::Arc;
 use std::time::Duration;
-use timebase::TimeBase;
 use tokio::signal;
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
@@ -78,9 +73,11 @@ async fn main() -> anyhow::Result<()> {
             config.ntp_server.addr,
             timebase.clone(),
             metrics.clone(),
-            state.last_rtt_ms.clone(),
+            state.last_sync_quality.clone(),
+            config.ntp_server.max_root_dispersion_ms,
         )
-        .with_max_packet_size(config.ntp_server.max_packet_size);
+        .with_max_packet_size(config.ntp_server.max_packet_size)
+        .with_manual_dispersion_ms(config.admin.dispersion_ms);
         Some(tokio::spawn(async move {
             if let Err(e) = ntp_server.run().await {
                 error!(error = %e, "NTP server terminated");
@@ -204,12 +201,16 @@ async fn sync_loop(
         state.metrics.ntp_sync_total.inc();
 
         match syncer.sync().await {
-            Ok(result) => {
+            Ok(outcome) => {
+                let result = outcome.result;
+                let diag = outcome.diagnostics;
+
                 // Update timebase
                 timebase.update(&result);
 
                 // Update state
                 state.record_sync_success();
+                *state.last_selection_diagnostics.write() = Some(diag.clone());
 
                 // Update metrics
                 state.metrics.ntp_last_sync_timestamp_seconds.set(
@@ -226,10 +227,10 @@ async fn sync_loop(
                     .metrics
                     .ntp_offset_seconds
                     .set(result.offset_ms as f64 / 1000.0);
-                state.last_rtt_ms.store(
-                    result.rtt.as_millis() as u64,
-                    std::sync::atomic::Ordering::Release,
-                );
+                let rtt_ms = result.rtt.as_millis() as u64;
+                state
+                    .last_rtt_ms
+                    .store(rtt_ms, std::sync::atomic::Ordering::Release);
                 *state.last_ntp_timing.write() = Some(NtpTimingSummary {
                     server: result.server.clone(),
                     t1_client_send_ms: result.t1_client_send_ms,
@@ -237,9 +238,139 @@ async fn sync_loop(
                     t3_server_send_ms: result.t3_server_send_ms,
                     t4_client_recv_ms: result.t4_client_recv_ms,
                     offset_ms: result.offset_ms,
-                    rtt_ms: result.rtt.as_millis() as u64,
+                    rtt_ms,
+                    root_delay_ms: result.root_delay_ms,
+                    root_dispersion_ms: result.root_dispersion_ms,
+                    stratum: result.stratum,
+                    leap: result.leap,
+                    precision_log2: result.precision_log2,
+                    reference_id: result.reference_id,
+                    timing_source: result.timing_source.clone(),
+                });
+                *state.last_sync_quality.write() = Some(SyncQuality {
+                    upstream_root_delay_ms: result.root_delay_ms,
+                    upstream_root_dispersion_ms: result.root_dispersion_ms,
+                    precision_log2: result.precision_log2,
+                    stratum: result.stratum,
+                    leap: result.leap,
+                    measured_rtt_ms: rtt_ms,
+                    jitter_ms: outcome.jitter_ms,
+                    offset_ms: result.offset_ms,
+                    last_sync_instant: std::time::Instant::now(),
+                    selected_server: result.server.clone(),
                 });
                 state.metrics.ntp_consecutive_failures.set(0);
+
+                // P1-6: selection metrics
+                state
+                    .metrics
+                    .ntp_selection_quorum_size
+                    .set(diag.quorum_size as i64);
+                state
+                    .metrics
+                    .ntp_selection_single_provider
+                    .set(if diag.single_provider { 1 } else { 0 });
+                if let Some(u) = diag.combined_uncertainty_ms {
+                    state.metrics.ntp_combined_uncertainty_milliseconds.set(u);
+                }
+                for (server, lambda_ms) in &diag.candidate_lambdas {
+                    state
+                        .metrics
+                        .ntp_sample_uncertainty_milliseconds
+                        .get_or_create(&ntp_time_json_api::metrics::ServerLabel {
+                            server: server.clone(),
+                        })
+                        .set(*lambda_ms);
+                }
+                for rejected in &diag.rejected_sources {
+                    state
+                        .metrics
+                        .ntp_selection_rejected_total
+                        .get_or_create(&RejectLabel {
+                            reason: rejected.reason.into(),
+                        })
+                        .inc();
+                    state.metrics.ntp_selection_falsetickers_total.inc();
+                }
+
+                // P1F-12: intersection metrics (on successful sync)
+                {
+                    let ix = &diag.intersection;
+                    state
+                        .metrics
+                        .ntp_intersection_truechimers
+                        .set(ix.truechimer_count as i64);
+                    state
+                        .metrics
+                        .ntp_intersection_ambiguous_clusters
+                        .set(ix.competing_cluster_count as i64);
+                    if let Some(w) = ix.intersection_width_ms {
+                        state.metrics.ntp_intersection_width_milliseconds.set(w);
+                    }
+                    if ix.falseticker_count > 0 {
+                        state
+                            .metrics
+                            .ntp_intersection_falsetickers_total
+                            .inc_by(ix.falseticker_count as u64);
+                    }
+                }
+
+                // P0-4: update quality-envelope metrics
+                let quality = state.compute_quality();
+                state
+                    .metrics
+                    .time_uncertainty_milliseconds
+                    .set(quality.uncertainty_ms.unwrap_or(0.0));
+                state.metrics.time_source_mode.set(match quality.source {
+                    "ntp" => 0,
+                    "degraded" => 1,
+                    "manual" => 3,
+                    _ => 2, // "unsynced"
+                });
+                state
+                    .metrics
+                    .time_serve_state
+                    .set(match quality.serve_state {
+                        "ok" => 0,
+                        "degraded" => 1,
+                        "stopped" => 2,
+                        _ => 3, // "unsynced"
+                    });
+
+                // P1-8: replica drift visibility metrics
+                let replica_label = ReplicaLabel {
+                    replica_id: config.replica.replica_id.clone(),
+                };
+                state
+                    .metrics
+                    .time_replica_offset_milliseconds
+                    .get_or_create(&replica_label)
+                    .set(result.offset_ms as f64);
+                state
+                    .metrics
+                    .time_replica_uncertainty_milliseconds
+                    .get_or_create(&replica_label)
+                    .set(quality.uncertainty_ms.unwrap_or(0.0));
+                state
+                    .metrics
+                    .time_replica_serve_state
+                    .get_or_create(&replica_label)
+                    .set(match quality.serve_state {
+                        "ok" => 0,
+                        "degraded" => 1,
+                        "stopped" => 2,
+                        _ => 3,
+                    });
+                state
+                    .metrics
+                    .time_replica_source_mode
+                    .get_or_create(&replica_label)
+                    .set(match quality.source {
+                        "ntp" => 0,
+                        "degraded" => 1,
+                        "manual" => 3,
+                        _ => 2,
+                    });
 
                 info!(
                     server = %result.server,
@@ -255,6 +386,28 @@ async fn sync_loop(
                     .metrics
                     .ntp_consecutive_failures
                     .set(state.get_consecutive_failures() as i64);
+
+                // Store selection diagnostics even on failure (e.g., no quorum)
+                if let Some(diag) = syncer.last_diagnostics() {
+                    // P1F-12: record intersection failure reason metric
+                    use ntp_time_json_api::ntp::selection::IntersectionState;
+                    let failure_reason = match &diag.intersection.state {
+                        IntersectionState::NoIntersection
+                        | IntersectionState::InsufficientQuorum => Some("no_intersection"),
+                        IntersectionState::AmbiguousCluster => Some("ambiguous_cluster"),
+                        _ => None,
+                    };
+                    if let Some(reason) = failure_reason {
+                        state
+                            .metrics
+                            .ntp_intersection_failures_total
+                            .get_or_create(&RejectLabel {
+                                reason: reason.to_string(),
+                            })
+                            .inc();
+                    }
+                    *state.last_selection_diagnostics.write() = Some(diag);
+                }
 
                 if timebase.has_synced() {
                     // We've synced before, so we can continue serving from cache
@@ -304,7 +457,7 @@ async fn probe_loop(syncer: Arc<NtpSyncer>, state: Arc<AppState>, config: Arc<Co
             state
                 .metrics
                 .ntp_server_up
-                .get_or_create(&metrics::ServerLabel {
+                .get_or_create(&ntp_time_json_api::metrics::ServerLabel {
                     server: server.clone(),
                 })
                 .set(is_up);
@@ -313,7 +466,7 @@ async fn probe_loop(syncer: Arc<NtpSyncer>, state: Arc<AppState>, config: Arc<Co
                 state
                     .metrics
                     .ntp_server_rtt_milliseconds
-                    .get_or_create(&metrics::ServerLabel { server })
+                    .get_or_create(&ntp_time_json_api::metrics::ServerLabel { server })
                     .set(rtt.as_millis() as i64);
             }
         }
@@ -326,13 +479,13 @@ fn init_logging(config: &Config) {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
     match config.logging.format {
-        config::LogFormat::Json => {
+        LogFormat::Json => {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(tracing_subscriber::fmt::layer().json())
                 .init();
         }
-        config::LogFormat::Pretty => {
+        LogFormat::Pretty => {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(tracing_subscriber::fmt::layer().pretty())

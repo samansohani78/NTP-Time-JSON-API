@@ -1,4 +1,5 @@
 pub mod handlers;
+pub mod handlers_admin;
 pub mod middleware;
 pub mod state;
 pub mod websocket;
@@ -21,7 +22,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     create_router_internal(state, enable_rate_limiting)
 }
 
-#[cfg(test)]
 pub fn create_router_for_test(state: Arc<AppState>) -> Router {
     create_router_internal(state, false)
 }
@@ -48,6 +48,9 @@ fn create_router_internal(state: Arc<AppState>, enable_rate_limiting: bool) -> R
         // Metrics (needs full stack for monitoring)
         .route("/metrics", get(handlers::metrics_handler))
         .route("/performance", get(handlers::performance_handler))
+        // Time-quality envelope endpoints (P0-4)
+        .route("/time/full", get(handlers::time_full_handler))
+        .route("/status", get(handlers::status_handler))
         .with_state(state.clone())
         // Middleware - applied bottom-up
         .layer(axum_middleware::from_fn_with_state(
@@ -72,7 +75,29 @@ fn create_router_internal(state: Arc<AppState>, enable_rate_limiting: bool) -> R
         .allow_headers(Any)
         .max_age(Duration::from_secs(3600));
 
-    let router = Router::new().merge(fast_router).merge(slow_router);
+    // Admin router — only registered when ADMIN_API_ENABLED=true.
+    // If disabled, /admin/* routes return 404 (not 401), per security contract.
+    let router = if config.admin.enabled {
+        let admin_router = Router::new()
+            .route(
+                "/admin/time/override",
+                get(handlers_admin::get_override)
+                    .post(handlers_admin::post_override)
+                    .delete(handlers_admin::delete_override),
+            )
+            .with_state(state.clone())
+            .layer(axum_middleware::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin_auth,
+            ))
+            .layer(RequestBodyLimitLayer::new(config.http.body_limit_bytes));
+        Router::new()
+            .merge(fast_router)
+            .merge(slow_router)
+            .merge(admin_router)
+    } else {
+        Router::new().merge(fast_router).merge(slow_router)
+    };
 
     // Apply rate limiting in production only (requires real IP addresses)
     let router = if enable_rate_limiting {
@@ -250,29 +275,29 @@ mod tests {
         config.ntp.servers = vec![ntp_addr.to_string()];
         config.ntp.timeout_secs = 5;
         config.ntp.require_sync = true;
+        config.ntp.selection.min_quorum = 1;
         let config = Arc::new(config);
 
         let state = make_state_with_config(config.clone());
         let syncer = NtpSyncer::new(config.ntp.clone().into());
 
         // Drive one real NTP sync.
-        let result = syncer
+        let outcome = syncer
             .sync()
             .await
             .expect("NTP sync should succeed against mock");
 
-        // The epoch returned by rsntp may differ slightly from `fixed_epoch_ms`
-        // due to RTT and the way rsntp calculates the offset, but it should be
-        // within a few seconds of the fixed value.
+        // The epoch returned may differ slightly from `fixed_epoch_ms`
+        // due to RTT and offset calculation, but should be within a few seconds.
         assert!(
-            (result.epoch_ms - fixed_epoch_ms).abs() < 5_000,
+            (outcome.result.epoch_ms - fixed_epoch_ms).abs() < 5_000,
             "epoch_ms {} too far from expected {}",
-            result.epoch_ms,
+            outcome.result.epoch_ms,
             fixed_epoch_ms
         );
 
         // Update the timebase.
-        state.timebase.update(&result);
+        state.timebase.update(&outcome.result);
         state.record_sync_success();
 
         // /time should now return 200.
@@ -301,6 +326,7 @@ mod tests {
     /// After a sync, /readyz and /startupz must return 200.
     #[tokio::test]
     async fn test_probes_return_200_after_sync() {
+        use crate::ntp::selection::TimingSource;
         let state = make_state();
 
         // Inject a sync result directly without going through the network.
@@ -314,6 +340,13 @@ mod tests {
             t2_server_recv_ms: 0,
             t3_server_send_ms: 0,
             t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 0,
+            stratum: 1,
+            leap: 0,
+            precision_log2: 0,
+            reference_id: 0,
+            timing_source: TimingSource::Estimated,
         };
         state.timebase.update(&sync_result);
         state.record_sync_success();
@@ -333,6 +366,7 @@ mod tests {
     /// /time values must be non-decreasing across sequential requests (monotonic).
     #[tokio::test]
     async fn test_time_is_monotonic() {
+        use crate::ntp::selection::TimingSource;
         let state = make_state();
 
         let sync_result = SyncResult {
@@ -345,6 +379,13 @@ mod tests {
             t2_server_recv_ms: 0,
             t3_server_send_ms: 0,
             t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 0,
+            stratum: 1,
+            leap: 0,
+            precision_log2: 0,
+            reference_id: 0,
+            timing_source: TimingSource::Estimated,
         };
         state.timebase.update(&sync_result);
         state.record_sync_success();
@@ -435,10 +476,11 @@ mod tests {
     }
 
     /// After a successful sync, /performance must include the RFC 5905
-    /// four-tuple in the `ntp_timing` object.
+    /// four-tuple and packet-level fields in the `ntp_timing` object.
     #[tokio::test]
     async fn test_performance_includes_ntp_timing_after_sync() {
         use crate::http::state::NtpTimingSummary;
+        use crate::ntp::selection::TimingSource;
 
         let state = make_state();
 
@@ -451,6 +493,13 @@ mod tests {
             t4_client_recv_ms: 1_700_000_001_021,
             offset_ms: 5,
             rtt_ms: 21,
+            root_delay_ms: 10,
+            root_dispersion_ms: 5,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -20,
+            reference_id: u32::from_be_bytes(*b"GPS "),
+            timing_source: TimingSource::Measured,
         });
 
         let app = create_router_for_test(state);
@@ -478,5 +527,221 @@ mod tests {
         assert_eq!(timing["t4_client_recv_ms"], 1_700_000_001_021_i64);
         assert_eq!(timing["offset_ms"], 5_i64);
         assert_eq!(timing["rtt_ms"], 21_u64);
+        // Packet-level fields must be present after P0-2
+        assert_eq!(timing["root_delay_ms"], 10_u32);
+        assert_eq!(timing["root_dispersion_ms"], 5_u32);
+        assert_eq!(timing["stratum"], 2_u8);
+        assert_eq!(timing["leap"], 0_u8);
+        assert_eq!(timing["precision_log2"], -20_i8);
+        assert_eq!(timing["timing_source"], "measured");
+    }
+
+    // ── P0-4: /status and /time/full endpoint tests ───────────────────────────
+
+    fn inject_quality(state: &AppState, upstream_dispersion_ms: u32) {
+        use crate::ntp::SyncQuality;
+        *state.last_sync_quality.write() = Some(SyncQuality {
+            upstream_root_delay_ms: 10,
+            upstream_root_dispersion_ms: upstream_dispersion_ms,
+            precision_log2: -10,
+            stratum: 2,
+            leap: 0,
+            measured_rtt_ms: 5,
+            jitter_ms: 0,
+            offset_ms: 1,
+            last_sync_instant: std::time::Instant::now(),
+            selected_server: "ntp.test:123".into(),
+        });
+        state.record_sync_success();
+    }
+
+    #[tokio::test]
+    async fn status_returns_200_with_full_envelope() {
+        use crate::ntp::selection::TimingSource;
+
+        let state = make_state();
+        let sync_result = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "ntp.test:123".into(),
+            rtt: Duration::from_millis(5),
+            instant: Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 10,
+            root_dispersion_ms: 1,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&sync_result);
+        inject_quality(&state, 1);
+
+        let app = create_router_for_test(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(json["source"].is_string(), "source field missing");
+        assert!(json["serve_state"].is_string(), "serve_state field missing");
+        assert!(json["ntp_synced"].as_bool().unwrap());
+        // uncertainty_ms, staleness_ms, stratum, selected_server, leap must be present (not null)
+        assert!(
+            !json["uncertainty_ms"].is_null(),
+            "uncertainty_ms should not be null after sync"
+        );
+        assert_eq!(json["stratum"], 2);
+        assert_eq!(json["selected_server"], "ntp.test:123");
+    }
+
+    #[tokio::test]
+    async fn status_unsynced_reports_unsynced_fields() {
+        let state = make_state();
+        // No sync done
+        let app = create_router_for_test(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "/status always returns 200");
+
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["source"], "unsynced");
+        assert_eq!(json["serve_state"], "unsynced");
+        assert!(json["uncertainty_ms"].is_null());
+        assert!(!json["ntp_synced"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn time_full_returns_enriched_json_after_sync() {
+        use crate::ntp::selection::TimingSource;
+
+        let state = make_state();
+        let sync_result = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "ntp.test:123".into(),
+            rtt: Duration::from_millis(5),
+            instant: Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 10,
+            root_dispersion_ms: 1,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&sync_result);
+        inject_quality(&state, 1);
+
+        let app = create_router_for_test(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/time/full")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Standard /time fields must be present
+        assert_eq!(json["status"], 200);
+        assert!(json["data"].as_i64().unwrap_or(0) > 0);
+        assert!(json["message"].is_string());
+        // Quality fields must be present
+        assert!(json["source"].is_string());
+        assert!(json["serve_state"].is_string());
+        assert!(!json["uncertainty_ms"].is_null());
+        assert_eq!(json["stratum"], 2);
+    }
+
+    #[tokio::test]
+    async fn time_headers_present_after_sync() {
+        use crate::ntp::selection::TimingSource;
+
+        let state = make_state();
+        let sync_result = SyncResult {
+            epoch_ms: 1_700_000_000_000,
+            server: "ntp.test:123".into(),
+            rtt: Duration::from_millis(5),
+            instant: Instant::now(),
+            offset_ms: 0,
+            t1_client_send_ms: 0,
+            t2_server_recv_ms: 0,
+            t3_server_send_ms: 0,
+            t4_client_recv_ms: 0,
+            root_delay_ms: 10,
+            root_dispersion_ms: 1,
+            stratum: 2,
+            leap: 0,
+            precision_log2: -10,
+            reference_id: 0,
+            timing_source: TimingSource::Measured,
+        };
+        state.timebase.update(&sync_result);
+        inject_quality(&state, 1);
+
+        let app = create_router_for_test(state);
+        let response = app
+            .oneshot(Request::builder().uri("/time").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let headers = response.headers();
+        assert!(
+            headers.contains_key("x-time-source"),
+            "x-time-source header missing from /time"
+        );
+        assert!(
+            headers.contains_key("x-time-serve-state"),
+            "x-time-serve-state header missing"
+        );
+        assert!(
+            headers.contains_key("x-time-uncertainty-ms"),
+            "x-time-uncertainty-ms missing"
+        );
+        assert!(
+            headers.contains_key("x-time-stratum"),
+            "x-time-stratum missing"
+        );
+        assert!(
+            headers.contains_key("x-time-staleness-ms"),
+            "x-time-staleness-ms missing"
+        );
+        assert!(
+            headers.contains_key("x-time-selected-server"),
+            "x-time-selected-server missing"
+        );
     }
 }

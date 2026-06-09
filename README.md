@@ -5,12 +5,21 @@ with Rust 1.92. It is **not yet financial/time-critical production-ready** — t
 the P0 tasks in [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md).
 
 > **Current limitations (see [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md)):**
-> - Upstream T2/T3 are **reconstructed (estimated)** from offset/delay, not measured server
->   timestamps (the `rsntp` client discards the raw timestamps).
-> - The UDP NTP server currently advertises **`root_dispersion = 0`** (false certainty).
-> - There is **no time-quality / uncertainty envelope** and no serve/stop SLA yet.
-> - There is **no secure manual time-override** path yet.
-> - There is **no full end-to-end CI** yet (unit + inline integration tests only).
+> - ~~Upstream T2/T3 reconstructed from offset/delay~~ — **fixed (P0-1/P0-2)**: T2/T3 and root
+>   fields are now read directly from NTP packet bytes via the in-house `PacketNtpClient`.
+> - ~~UDP NTP server advertises `root_dispersion = 0`~~ — **fixed (P0-3)**: UDP replies now carry
+>   honest `root_delay` (upstream + local RTT) and `root_dispersion` (RFC 5905 §11.2 formula:
+>   upstream dispersion + precision + PHI×age + RTT/2, clamped to `MAX_ROOT_DISPERSION_MS`).
+> - ~~There is no time-quality / uncertainty envelope and no serve/stop SLA~~ — **fixed (P0-4)**:
+>   `/status`, `/time/full`, quality response headers (`X-Time-Source`, `X-Time-Serve-State`,
+>   `X-Time-Uncertainty-Ms`, `X-Time-Stratum`, `X-Time-Staleness-Ms`, `X-Time-Selected-Server`),
+>   and the serve/stop policy (503 when uncertainty exceeds
+>   `SERVE_OK_MAX_UNCERTAINTY_MS`/`SERVE_DEGRADED_MAX_UNCERTAINTY_MS`) are all live.
+>   `/readyz` gates on `READINESS_MAX_UNCERTAINTY_MS` (250 ms default) after first sync.
+> - There is **no secure manual time-override** path yet — P1-7.
+> - ~~There is no full end-to-end CI~~ — **fixed (P0-5)**: real E2E harness (`tests/e2e_*.rs`)
+>   exercises HTTP, UDP NTP, WebSocket, and metrics endpoints against an in-process server using a
+>   mock NTP upstream; CI `e2e` job runs on every push. Use `make e2e` locally.
 >
 > For financial / latency-sensitive deployments, follow the P0/P1 roadmap in
 > [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md) before relying on this service as an
@@ -69,7 +78,7 @@ This ensures:
 Critical for Kubernetes: probes are designed so NTP failures don't kill pods after initial sync.
 
 - **`/healthz`**: Always returns 200 if process is alive
-- **`/readyz`**: Returns 503 before first sync (if `REQUIRE_SYNC=true`), then always 200
+- **`/readyz`**: Returns 503 before first sync (if `REQUIRE_SYNC=true`); after first sync, returns 503 when `uncertainty_ms > READINESS_MAX_UNCERTAINTY_MS` (default 250 ms), otherwise 200
 - **`/startupz`**: Returns 503 until first successful sync, then always 200
 - **`/time`**: Returns 503 before first sync (if `REQUIRE_SYNC=true`), then always 200 (serves from cache)
 
@@ -88,6 +97,14 @@ Returns current NTP-derived epoch time in milliseconds.
 }
 ```
 
+**Quality response headers (P0-4):**
+- `X-Time-Source: ntp` | `degraded` | `unsynced`
+- `X-Time-Serve-State: ok` | `degraded` | `stopped` | `unsynced`
+- `X-Time-Uncertainty-Ms: 4.872` (omitted when unsynced)
+- `X-Time-Stratum: 2` (omitted when unsynced)
+- `X-Time-Staleness-Ms: 1200` (omitted when unsynced)
+- `X-Time-Selected-Server: time.google.com:123` (omitted when unsynced)
+
 **Before First Sync (REQUIRE_SYNC=true):**
 ```json
 {
@@ -98,13 +115,56 @@ Returns current NTP-derived epoch time in milliseconds.
 }
 ```
 
+**Serve/stop policy (P0-4):** after first sync, if computed uncertainty exceeds
+`SERVE_OK_MAX_UNCERTAINTY_MS` (default 50 ms) and `ALLOW_DEGRADED=false` (default), `/time` returns
+503 with `serve_state: "stopped"` to prevent serving low-quality time.
+
+### `GET /time/full`
+
+Enriched time response. Same policy as `/time` but body includes quality fields. Runs on the slow
+router (full middleware, not zero-copy cache). Not backward-compatible — use `/time` + headers if
+you need stability.
+
+```json
+{
+  "message": "done",
+  "status": 200,
+  "data": 1704067200000,
+  "source": "ntp",
+  "serve_state": "ok",
+  "uncertainty_ms": 4.87,
+  "staleness_ms": 1200,
+  "stratum": 2,
+  "selected_server": "time.google.com:123",
+  "leap": 0
+}
+```
+
+### `GET /status`
+
+Operational quality envelope. Always returns 200 regardless of serve state — read `serve_state` to
+determine whether `/time` would return 200 or 503.
+
+```json
+{
+  "source": "ntp",
+  "serve_state": "ok",
+  "uncertainty_ms": 4.87,
+  "staleness_ms": 1200,
+  "stratum": 2,
+  "selected_server": "time.google.com:123",
+  "leap": 0,
+  "ntp_synced": true
+}
+```
+
 ### `GET /healthz`
 
 Liveness probe - always returns 200 if process is alive.
 
 ### `GET /readyz`
 
-Readiness probe - returns 503 before first sync, then always 200.
+Readiness probe. Returns 503 before first sync (if `REQUIRE_SYNC=true`). After first sync, returns 503 when `uncertainty_ms > READINESS_MAX_UNCERTAINTY_MS` (default 250 ms), otherwise 200.
 
 ### `GET /startupz`
 
@@ -191,6 +251,27 @@ All configuration via environment variables:
 | `OFFSET_BIAS_MS` | `0` | Manual time offset bias |
 | `ASYMMETRY_BIAS_MS` | `0` | Manual asymmetry bias |
 
+### Quality / SLA Configuration (P0-4)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALLOW_DEGRADED` | `false` | When false, uncertainty > `SERVE_OK_MAX_UNCERTAINTY_MS` triggers 503. When true, uncertainty up to `SERVE_DEGRADED_MAX_UNCERTAINTY_MS` returns 200 with `source="degraded"`. |
+| `SERVE_OK_MAX_UNCERTAINTY_MS` | `50` | Max uncertainty (ms) for `serve_state="ok"` |
+| `SERVE_DEGRADED_MAX_UNCERTAINTY_MS` | `250` | Max uncertainty (ms) to serve at all (when `ALLOW_DEGRADED=true`). Must be > `SERVE_OK_MAX_UNCERTAINTY_MS`. |
+| `READINESS_MAX_UNCERTAINTY_MS` | `250` | Max uncertainty (ms) for `/readyz` to return 200 after first sync |
+
+### Replica Identity Configuration (P1-8)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REPLICA_ID` | `$HOSTNAME` or `replica-<pid>` | Unique identifier for this replica, attached to all replica-labeled Prometheus metrics. In Kubernetes, set via downward API (`metadata.name`) to use the pod name. Max 128 characters. |
+
+### Interval-Intersection Selection Configuration (P1F-12)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NTP_INTERVAL_SELECTION_ENABLED` | `true` | Enable Marzullo/interval-intersection pre-filter before the weighted-median step. When true, candidates whose uncertainty intervals don't overlap the consensus region (falsetickers) are discarded; ambiguous competing clusters cause fail-closed. Set to `false` to disable (not recommended in production). |
+
 ### Logging Configuration
 
 | Variable | Default | Description |
@@ -233,7 +314,9 @@ cargo build --release
 ### Run Tests
 
 ```bash
-cargo test
+cargo test        # all tests: unit + inline integration + E2E (132 tests)
+make e2e          # E2E tests only: HTTP, UDP NTP, WebSocket, metrics (22 tests)
+make ci           # fmt-check + clippy + all tests (same as CI)
 ```
 
 ### Run Locally
@@ -337,6 +420,40 @@ distinguish them from the upstream-source metrics above (renamed from the former
 - `ntp_udp_server_responses_total` - UDP NTP responses sent
 - `ntp_udp_server_errors_total` - UDP NTP errors (malformed packets, send failures, rate-limited drops)
 - `ntp_udp_server_unsynced_responses_total` - Responses sent while unsynced (LI=3, Stratum=16)
+
+### Time-Quality Envelope Metrics (P0-4)
+
+- `time_uncertainty_milliseconds` - Computed time uncertainty (ms) from most recent NTP sync (RFC 5905 §11.2)
+- `time_source_mode` - Time source mode: 0=ntp, 1=degraded, 2=unsynced
+- `time_serve_state` - Serve state: 0=ok, 1=degraded, 2=stopped, 3=unsynced
+
+### Replica Drift Metrics (P1-8)
+
+All four metrics below are labeled `{replica_id="..."}` so Prometheus can aggregate across replicas to detect drift. Each replica reports only its own state — no gossip or coordination.
+
+- `time_replica_offset_milliseconds{replica_id}` — NTP offset from most recent sync (ms)
+- `time_replica_uncertainty_milliseconds{replica_id}` — Combined uncertainty, provider-cap inflated (ms)
+- `time_replica_serve_state{replica_id}` — Serve state: 0=ok, 1=degraded, 2=stopped, 3=unsynced
+- `time_replica_source_mode{replica_id}` — Source mode: 0=ntp, 1=degraded, 2=unsynced, 3=manual
+
+**Prometheus alerts** (`k8s/prometheus-rules.yaml`):
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| `NtpTimeReplicaHighUncertainty` | `time_replica_uncertainty_milliseconds > 250` for 5 min | warning |
+| `NtpTimeReplicaStopped` | `time_replica_serve_state > 1` for 2 min | critical |
+| `NtpTimeReplicaSpreadHigh` | `max - min` offset across replicas > 100 ms for 5 min | warning |
+| `NtpTimeSingleProvider` | `ntp_selection_single_provider == 1` for 10 min | warning |
+
+### Interval-Intersection Metrics (P1F-12)
+
+After each NTP sync, the following metrics reflect the Marzullo sweep result:
+
+- `ntp_intersection_truechimers` — gauge: count of truechimers (servers whose intervals span the consensus region)
+- `ntp_intersection_falsetickers_total` — counter: cumulative count of falsetickers discarded across all syncs
+- `ntp_intersection_width_milliseconds` — gauge: width of the intersection region (ms); wider = more uncertainty
+- `ntp_intersection_failures_total{reason}` — counter: intersection failures by reason (`no_intersection`, `ambiguous_cluster`)
+- `ntp_intersection_ambiguous_clusters` — gauge: number of competing clusters found (≥ 2 means AmbiguousCluster was detected)
 
 ### Build Info
 

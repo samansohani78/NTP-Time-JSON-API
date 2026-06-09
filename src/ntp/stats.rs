@@ -1,4 +1,7 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+const JITTER_RING_SIZE: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ServerStats {
@@ -13,6 +16,8 @@ pub struct ServerStats {
     pub total_queries: u64,
     pub total_failures: u64,
     pub disabled: bool,
+    /// Ring buffer of the last JITTER_RING_SIZE offset_ms values for this server.
+    recent_offsets: VecDeque<i64>,
 }
 
 impl ServerStats {
@@ -26,7 +31,36 @@ impl ServerStats {
             total_queries: 0,
             total_failures: 0,
             disabled: false,
+            recent_offsets: VecDeque::with_capacity(JITTER_RING_SIZE),
         }
+    }
+
+    /// Record a new offset sample for jitter computation.
+    pub fn record_offset(&mut self, offset_ms: i64) {
+        if self.recent_offsets.len() >= JITTER_RING_SIZE {
+            self.recent_offsets.pop_front();
+        }
+        self.recent_offsets.push_back(offset_ms);
+    }
+
+    /// Compute jitter as the population standard deviation of recent offsets (ms).
+    /// Returns 0 when fewer than 2 samples have been recorded.
+    pub fn jitter_ms(&self) -> u64 {
+        let n = self.recent_offsets.len();
+        if n < 2 {
+            return 0;
+        }
+        let mean = self.recent_offsets.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+        let var = self
+            .recent_offsets
+            .iter()
+            .map(|&x| {
+                let d = x as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n as f64;
+        var.sqrt().ceil() as u64
     }
 
     pub fn record_success(&mut self, rtt: Duration) -> bool {

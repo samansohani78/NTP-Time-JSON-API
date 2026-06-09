@@ -26,6 +26,16 @@ pub struct BuildInfoLabels {
     pub git_sha: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RejectLabel {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ReplicaLabel {
+    pub replica_id: String,
+}
+
 pub struct Metrics {
     registry: Registry,
 
@@ -51,6 +61,62 @@ pub struct Metrics {
     pub ntp_udp_server_responses_total: Counter,
     pub ntp_udp_server_errors_total: Counter,
     pub ntp_udp_server_unsynced_responses_total: Counter,
+    /// Most recently advertised `root_dispersion` in synced UDP NTP replies (seconds).
+    pub ntp_udp_server_root_dispersion_seconds: Gauge<f64, AtomicU64>,
+
+    // Time-quality envelope metrics (P0-4)
+    /// Computed time uncertainty (ms) from the most recent sync quality snapshot.
+    pub time_uncertainty_milliseconds: Gauge<f64, AtomicU64>,
+    /// Encoded time source mode: 0=ntp, 1=degraded, 2=unsynced, 3=manual.
+    pub time_source_mode: Gauge,
+    /// Encoded serve state: 0=ok, 1=degraded, 2=stopped, 3=unsynced.
+    pub time_serve_state: Gauge,
+
+    // P1-6 selection metrics
+    /// Number of agreers in the most recent weighted-median selection.
+    pub ntp_selection_quorum_size: Gauge,
+    /// Servers eliminated by a hard gate in the most recent selection.
+    pub ntp_selection_falsetickers_total: Counter,
+    /// Per-server λ (root distance) from the most recent selection (ms).
+    pub ntp_sample_uncertainty_milliseconds: Family<ServerLabel, Gauge<f64, AtomicU64>>,
+    /// Combined uncertainty of the selected result (ms); set after each sync.
+    pub ntp_combined_uncertainty_milliseconds: Gauge<f64, AtomicU64>,
+    /// Total samples rejected in selection, broken down by reason.
+    pub ntp_selection_rejected_total: Family<RejectLabel, Counter>,
+    /// 1 when the last selection had one provider group dominating the agreers.
+    pub ntp_selection_single_provider: Gauge,
+
+    // P1F-12 interval-intersection metrics
+    /// Truechimer count from the most recent Marzullo sweep (0 when disabled or failed).
+    pub ntp_intersection_truechimers: Gauge,
+    /// Total falsetickers discarded by the interval-intersection filter across all syncs.
+    pub ntp_intersection_falsetickers_total: Counter,
+    /// Width of the intersection region from the most recent sync (ms); 0 if no intersection.
+    pub ntp_intersection_width_milliseconds: Gauge<f64, AtomicU64>,
+    /// Total intersection failures broken down by reason (no_intersection, ambiguous_cluster, …).
+    pub ntp_intersection_failures_total: Family<RejectLabel, Counter>,
+    /// Number of competing clusters found in the most recent sweep (≥ 2 → AmbiguousCluster).
+    pub ntp_intersection_ambiguous_clusters: Gauge,
+
+    // P1-8 replica drift visibility metrics (labeled with replica_id)
+    /// Current NTP offset of this replica (ms). Populated after each sync.
+    pub time_replica_offset_milliseconds: Family<ReplicaLabel, Gauge<f64, AtomicU64>>,
+    /// Current combined time uncertainty of this replica (ms).
+    pub time_replica_uncertainty_milliseconds: Family<ReplicaLabel, Gauge<f64, AtomicU64>>,
+    /// Serve state of this replica: 0=ok, 1=degraded, 2=stopped, 3=unsynced.
+    pub time_replica_serve_state: Family<ReplicaLabel, Gauge>,
+    /// Time source mode of this replica: 0=ntp, 1=degraded, 2=unsynced, 3=manual.
+    pub time_replica_source_mode: Family<ReplicaLabel, Gauge>,
+
+    // Manual override metrics (P1-7)
+    /// 1 while a manual time override is active, 0 otherwise.
+    pub manual_override_active: Gauge,
+    /// Total number of manual time overrides set since process start.
+    pub manual_override_total: Counter,
+    /// Unix timestamp (seconds) when the current override expires; 0 if none active.
+    pub manual_override_expiry_timestamp_seconds: Gauge,
+    /// Total override requests rejected, broken down by reason label.
+    pub manual_override_rejected_total: Family<RejectLabel, Counter>,
 
     // Build info
     #[allow(dead_code)]
@@ -154,6 +220,86 @@ impl Metrics {
             ntp_consecutive_failures.clone(),
         );
 
+        // P1-6 selection metrics
+        let ntp_selection_quorum_size = Gauge::default();
+        registry.register(
+            "ntp_selection_quorum_size",
+            "Number of agreers in the most recent weighted-median NTP selection",
+            ntp_selection_quorum_size.clone(),
+        );
+
+        let ntp_selection_falsetickers_total = Counter::default();
+        registry.register(
+            "ntp_selection_falsetickers_total",
+            "Total NTP samples rejected by hard gates across all syncs",
+            ntp_selection_falsetickers_total.clone(),
+        );
+
+        let ntp_sample_uncertainty_milliseconds =
+            Family::<ServerLabel, Gauge<f64, AtomicU64>>::default();
+        registry.register(
+            "ntp_sample_uncertainty_milliseconds",
+            "Per-server root-distance λ from the most recent selection (ms)",
+            ntp_sample_uncertainty_milliseconds.clone(),
+        );
+
+        let ntp_combined_uncertainty_milliseconds = Gauge::<f64, AtomicU64>::default();
+        registry.register(
+            "ntp_combined_uncertainty_milliseconds",
+            "Combined uncertainty of the selected NTP result (ms)",
+            ntp_combined_uncertainty_milliseconds.clone(),
+        );
+
+        let ntp_selection_rejected_total = Family::<RejectLabel, Counter>::default();
+        registry.register(
+            "ntp_selection_rejected_total",
+            "Total NTP samples rejected by selection hard gates, by reason",
+            ntp_selection_rejected_total.clone(),
+        );
+
+        let ntp_selection_single_provider = Gauge::default();
+        registry.register(
+            "ntp_selection_single_provider",
+            "1 when one provider group dominates the agreers (uncertainty doubled)",
+            ntp_selection_single_provider.clone(),
+        );
+
+        // P1F-12 interval-intersection metrics
+        let ntp_intersection_truechimers = Gauge::default();
+        registry.register(
+            "ntp_intersection_truechimers",
+            "Truechimer count from the most recent Marzullo sweep",
+            ntp_intersection_truechimers.clone(),
+        );
+
+        let ntp_intersection_falsetickers_total = Counter::default();
+        registry.register(
+            "ntp_intersection_falsetickers_total",
+            "Total falsetickers discarded by the interval-intersection filter",
+            ntp_intersection_falsetickers_total.clone(),
+        );
+
+        let ntp_intersection_width_milliseconds = Gauge::<f64, AtomicU64>::default();
+        registry.register(
+            "ntp_intersection_width_milliseconds",
+            "Width of the intersection region from the most recent sync (ms)",
+            ntp_intersection_width_milliseconds.clone(),
+        );
+
+        let ntp_intersection_failures_total = Family::<RejectLabel, Counter>::default();
+        registry.register(
+            "ntp_intersection_failures_total",
+            "Total intersection failures by reason (no_intersection, ambiguous_cluster, …)",
+            ntp_intersection_failures_total.clone(),
+        );
+
+        let ntp_intersection_ambiguous_clusters = Gauge::default();
+        registry.register(
+            "ntp_intersection_ambiguous_clusters",
+            "Competing cluster count from the most recent Marzullo sweep (>= 2 → AmbiguousCluster)",
+            ntp_intersection_ambiguous_clusters.clone(),
+        );
+
         // NTP server (inbound UDP) metrics
         let ntp_udp_server_requests_total = Counter::default();
         registry.register(
@@ -183,6 +329,95 @@ impl Metrics {
             ntp_udp_server_unsynced_responses_total.clone(),
         );
 
+        let ntp_udp_server_root_dispersion_seconds = Gauge::<f64, AtomicU64>::default();
+        registry.register(
+            "ntp_udp_server_root_dispersion_seconds",
+            "Most recently advertised root_dispersion in synced UDP NTP replies (seconds)",
+            ntp_udp_server_root_dispersion_seconds.clone(),
+        );
+
+        // Time-quality envelope metrics (P0-4)
+        let time_uncertainty_milliseconds = Gauge::<f64, AtomicU64>::default();
+        registry.register(
+            "time_uncertainty_milliseconds",
+            "Computed time uncertainty (ms) from most recent NTP sync quality (RFC 5905 §11.2)",
+            time_uncertainty_milliseconds.clone(),
+        );
+
+        let time_source_mode = Gauge::default();
+        registry.register(
+            "time_source_mode",
+            "Time source mode: 0=ntp, 1=degraded, 2=unsynced",
+            time_source_mode.clone(),
+        );
+
+        let time_serve_state = Gauge::default();
+        registry.register(
+            "time_serve_state",
+            "Serve state: 0=ok, 1=degraded, 2=stopped, 3=unsynced",
+            time_serve_state.clone(),
+        );
+
+        // P1-8 replica drift visibility metrics
+        let time_replica_offset_milliseconds =
+            Family::<ReplicaLabel, Gauge<f64, AtomicU64>>::default();
+        registry.register(
+            "time_replica_offset_milliseconds",
+            "NTP offset of this replica in milliseconds (updated on each sync)",
+            time_replica_offset_milliseconds.clone(),
+        );
+
+        let time_replica_uncertainty_milliseconds =
+            Family::<ReplicaLabel, Gauge<f64, AtomicU64>>::default();
+        registry.register(
+            "time_replica_uncertainty_milliseconds",
+            "Combined time uncertainty of this replica in milliseconds",
+            time_replica_uncertainty_milliseconds.clone(),
+        );
+
+        let time_replica_serve_state = Family::<ReplicaLabel, Gauge>::default();
+        registry.register(
+            "time_replica_serve_state",
+            "Serve state of this replica: 0=ok, 1=degraded, 2=stopped, 3=unsynced",
+            time_replica_serve_state.clone(),
+        );
+
+        let time_replica_source_mode = Family::<ReplicaLabel, Gauge>::default();
+        registry.register(
+            "time_replica_source_mode",
+            "Time source mode of this replica: 0=ntp, 1=degraded, 2=unsynced, 3=manual",
+            time_replica_source_mode.clone(),
+        );
+
+        // Manual override metrics (P1-7)
+        let manual_override_active = Gauge::default();
+        registry.register(
+            "manual_override_active",
+            "Whether a manual time override is currently active (0/1)",
+            manual_override_active.clone(),
+        );
+
+        let manual_override_total = Counter::default();
+        registry.register(
+            "manual_override_total",
+            "Total number of manual time overrides set since process start",
+            manual_override_total.clone(),
+        );
+
+        let manual_override_expiry_timestamp_seconds = Gauge::default();
+        registry.register(
+            "manual_override_expiry_timestamp_seconds",
+            "Unix timestamp (seconds) when the current manual override expires; 0 if none active",
+            manual_override_expiry_timestamp_seconds.clone(),
+        );
+
+        let manual_override_rejected_total = Family::<RejectLabel, Counter>::default();
+        registry.register(
+            "manual_override_rejected_total",
+            "Total manual override requests rejected, by reason",
+            manual_override_rejected_total.clone(),
+        );
+
         // Build info
         let build_info = Family::<BuildInfoLabels, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
@@ -208,10 +443,33 @@ impl Metrics {
             ntp_server_up,
             ntp_server_rtt_milliseconds,
             ntp_consecutive_failures,
+            ntp_selection_quorum_size,
+            ntp_selection_falsetickers_total,
+            ntp_sample_uncertainty_milliseconds,
+            ntp_combined_uncertainty_milliseconds,
+            ntp_selection_rejected_total,
+            ntp_selection_single_provider,
+            ntp_intersection_truechimers,
+            ntp_intersection_falsetickers_total,
+            ntp_intersection_width_milliseconds,
+            ntp_intersection_failures_total,
+            ntp_intersection_ambiguous_clusters,
+            time_replica_offset_milliseconds,
+            time_replica_uncertainty_milliseconds,
+            time_replica_serve_state,
+            time_replica_source_mode,
             ntp_udp_server_requests_total,
             ntp_udp_server_responses_total,
             ntp_udp_server_errors_total,
             ntp_udp_server_unsynced_responses_total,
+            ntp_udp_server_root_dispersion_seconds,
+            time_uncertainty_milliseconds,
+            time_source_mode,
+            time_serve_state,
+            manual_override_active,
+            manual_override_total,
+            manual_override_expiry_timestamp_seconds,
+            manual_override_rejected_total,
             build_info,
         }
     }

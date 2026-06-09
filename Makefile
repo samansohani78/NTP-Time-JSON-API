@@ -1,10 +1,12 @@
-.PHONY: help build test lint fmt check clean run docker-build docker-up docker-down docker-logs
+.PHONY: help build test e2e full-test lint fmt check clean run docker-build docker-up docker-down docker-logs
 
 # Default target
 help:
 	@echo "Available targets:"
 	@echo "  build        - Build release binary"
-	@echo "  test         - Run all tests"
+	@echo "  test         - Run all tests (unit + integration + E2E)"
+	@echo "  e2e          - Run only E2E integration tests"
+	@echo "  full-test    - Alias for test (runs everything)"
 	@echo "  lint         - Run clippy linter"
 	@echo "  fmt          - Format code with rustfmt"
 	@echo "  check        - Run cargo check"
@@ -19,9 +21,16 @@ help:
 build:
 	cargo build --release
 
-# Run all tests
+# Run all tests (unit + integration + E2E)
 test:
-	cargo test --all-targets --all-features
+	cargo test --all-features
+
+# Run only E2E integration test binaries (requires no live services)
+e2e:
+	cargo test --test e2e_http --test e2e_ntp_udp --test e2e_websocket --test e2e_metrics
+
+# Full test suite — identical to `test`; kept for explicitness
+full-test: test
 
 # Run clippy linter
 lint:

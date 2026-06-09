@@ -75,13 +75,9 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
 
             let message = match state_clone.timebase.now_ms() {
                 Some(epoch_ms) => {
-                    // Determine if stale
-                    let is_stale = state_clone
-                        .get_staleness_seconds()
-                        .map(|s| s > state_clone.config.ntp.max_staleness_secs)
-                        .unwrap_or(false);
-
-                    let staleness_secs = state_clone.get_staleness_seconds().unwrap_or(0);
+                    let quality = state_clone.compute_quality();
+                    let is_stale = quality.serve_state != "ok";
+                    let staleness_secs = quality.staleness_ms.unwrap_or(0) / 1000;
 
                     json!({
                         "type": "tick",
@@ -95,6 +91,11 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
                             &state_clone.config.messages.ok
                         },
                         "sequence": count,
+                        // P0-4 quality fields
+                        "source": quality.source,
+                        "serve_state": quality.serve_state,
+                        "uncertainty_ms": quality.uncertainty_ms,
+                        "staleness_ms": quality.staleness_ms,
                     })
                 }
                 None => {
@@ -102,6 +103,8 @@ async fn websocket_connection(socket: WebSocket, state: Arc<AppState>) {
                         "type": "error",
                         "message": &state_clone.config.messages.error_no_sync,
                         "sequence": count,
+                        "source": "unsynced",
+                        "serve_state": "unsynced",
                     })
                 }
             };

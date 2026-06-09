@@ -148,12 +148,11 @@ impl NtpPacket {
     }
 }
 
-/// Parse an NTP packet from raw bytes.
+/// Parse any NTP packet from raw bytes without mode validation.
 ///
-/// Accepts any buffer of length >= 48; only the first 48 bytes are
-/// interpreted. Returns `UnsupportedMode` for non-client packets and
-/// `UnsupportedVersion` for versions other than 3/4.
-pub fn parse_packet(bytes: &[u8]) -> Result<NtpPacket, ProtocolError> {
+/// Shared by both `parse_packet` (server-side, validates MODE_CLIENT) and
+/// `parse_server_response` (client-side, no mode restriction).
+fn parse_inner(bytes: &[u8]) -> Result<NtpPacket, ProtocolError> {
     if bytes.len() < NTP_PACKET_SIZE {
         return Err(ProtocolError::TooShort {
             received: bytes.len(),
@@ -164,14 +163,9 @@ pub fn parse_packet(bytes: &[u8]) -> Result<NtpPacket, ProtocolError> {
     let li = b0 >> 6;
     let vn = (b0 >> 3) & 0x07;
     let mode = b0 & 0x07;
-
-    if mode != MODE_CLIENT {
-        return Err(ProtocolError::UnsupportedMode(mode));
-    }
     if vn != NTP_VERSION && vn != NTP_VERSION_3 {
         return Err(ProtocolError::UnsupportedVersion(vn));
     }
-
     Ok(NtpPacket {
         li,
         vn,
@@ -187,6 +181,46 @@ pub fn parse_packet(bytes: &[u8]) -> Result<NtpPacket, ProtocolError> {
         receive_timestamp: read_u64(&bytes[32..40]),
         transmit_timestamp: read_u64(&bytes[40..48]),
     })
+}
+
+/// Parse an NTP packet from raw bytes.
+///
+/// Accepts any buffer of length >= 48; only the first 48 bytes are
+/// interpreted. Returns `UnsupportedMode` for non-client packets and
+/// `UnsupportedVersion` for versions other than 3/4.
+///
+/// Used by the UDP NTP server to validate incoming client requests.
+pub fn parse_packet(bytes: &[u8]) -> Result<NtpPacket, ProtocolError> {
+    let pkt = parse_inner(bytes)?;
+    if pkt.mode != MODE_CLIENT {
+        return Err(ProtocolError::UnsupportedMode(pkt.mode));
+    }
+    Ok(pkt)
+}
+
+/// Parse an NTP server response from raw bytes.
+///
+/// Like `parse_packet` but does not check mode — server responses use
+/// mode 4 (server). Semantic validation (origin mismatch, KoD, leap alarm,
+/// zero transmit) is the caller's responsibility.
+pub fn parse_server_response(bytes: &[u8]) -> Result<NtpPacket, ProtocolError> {
+    parse_inner(bytes)
+}
+
+/// Convert an NTP short format value (16.16 fixed-point seconds) to milliseconds.
+///
+/// NTP short: upper 16 bits = integer seconds, lower 16 bits = fractional seconds.
+/// Used for `root_delay` and `root_dispersion` fields.
+pub fn ntp_short_to_ms(raw: u32) -> u64 {
+    (raw as u64 * 1000) >> 16
+}
+
+/// Convert a precision exponent (log2 seconds) to milliseconds.
+///
+/// NTP `precision` field: log2 of the clock precision in seconds.
+/// Typical values: -20 ≈ 1 µs, -10 ≈ 1 ms.
+pub fn precision_log2_to_ms(p: i8) -> f64 {
+    2f64.powi(p as i32) * 1000.0
 }
 
 /// Serialize a packet into a 48-byte buffer (big-endian wire format).
@@ -400,5 +434,56 @@ mod tests {
         buf.extend_from_slice(&[0xFF; 32]);
         let p = parse_packet(&buf).expect("should still parse");
         assert_eq!(p.mode, MODE_CLIENT);
+    }
+
+    #[test]
+    fn parse_server_response_accepts_mode_server() {
+        let mut buf = [0u8; NTP_PACKET_SIZE];
+        // LI=0 VN=4 Mode=4 (server)
+        buf[0] = (NTP_VERSION << 3) | MODE_SERVER;
+        buf[1] = 2; // stratum 2
+        let p = parse_server_response(&buf).expect("should parse server response");
+        assert_eq!(p.mode, MODE_SERVER);
+        assert_eq!(p.vn, NTP_VERSION);
+        assert_eq!(p.stratum, 2);
+    }
+
+    #[test]
+    fn parse_server_response_rejects_bad_version() {
+        let mut buf = [0u8; NTP_PACKET_SIZE];
+        buf[0] = (1u8 << 3) | MODE_SERVER; // VN=1, Mode=4
+        let err = parse_server_response(&buf).unwrap_err();
+        assert!(matches!(err, ProtocolError::UnsupportedVersion(1)));
+    }
+
+    #[test]
+    fn ntp_short_to_ms_whole_seconds() {
+        // 0x00010000 = 1 second exactly
+        assert_eq!(ntp_short_to_ms(0x00010000), 1000);
+        // 0x00040000 = 4 seconds
+        assert_eq!(ntp_short_to_ms(0x00040000), 4000);
+        // zero
+        assert_eq!(ntp_short_to_ms(0), 0);
+    }
+
+    #[test]
+    fn ntp_short_to_ms_fractional() {
+        // 0x00008000 = 0.5 seconds = 500 ms
+        assert_eq!(ntp_short_to_ms(0x00008000), 500);
+    }
+
+    #[test]
+    fn precision_log2_to_ms_typical_values() {
+        // 2^-20 * 1000 ≈ 0.000954 ms (microsecond precision)
+        let us = precision_log2_to_ms(-20);
+        assert!(
+            us > 0.0 && us < 0.01,
+            "precision -20 should be ~1µs, got {us}"
+        );
+        // 2^0 * 1000 = 1000 ms (1-second precision)
+        assert!((precision_log2_to_ms(0) - 1000.0).abs() < 1e-9);
+        // 2^-10 * 1000 ≈ 0.977 ms
+        let ms = precision_log2_to_ms(-10);
+        assert!((ms - 0.9765625).abs() < 1e-9);
     }
 }

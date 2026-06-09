@@ -53,7 +53,7 @@ SLA numbers, product behavior) are listed in §9 — they do not block starting 
 ## 2. P0 Tasks — Correctness Foundation (implementation-ready)
 
 ### Task P0-1: Implement a packet-level async NTP client
-**Status:** todo **Priority:** P0 **Risk:** medium
+**Status:** done **Priority:** P0 **Risk:** medium
 
 **Affected files**
 - `src/ntp/client.rs` *(new)* — the client + `NtpSample` + `trait NtpClient`.
@@ -123,7 +123,7 @@ pub fn precision_log2_to_ms(p: i8) -> f64 { 2f64.powi(p as i32) * 1000.0 }
 ---
 
 ### Task P0-2: Wire the client into sync; carry real fields end-to-end
-**Status:** todo **Priority:** P0 **Risk:** medium
+**Status:** done **Priority:** P0 **Risk:** medium
 
 **Affected files**
 - `src/ntp/sync.rs` — `query_ntp_server` calls `NtpClient::query`; `NtpSyncer` holds
@@ -173,7 +173,7 @@ pub last_sync_quality: Arc<parking_lot::RwLock<Option<SyncQuality>>>, // in AppS
 ---
 
 ### Task P0-3: Honest `root_delay` / `root_dispersion` on the UDP NTP server
-**Status:** todo **Priority:** P0 **Risk:** low (depends on P0-2)
+**Status:** done **Priority:** P0 **Risk:** low (depends on P0-2)
 
 **Affected files**
 - `src/ntp/server.rs` — `build_response` takes `Option<&SyncQuality>`; new dispersion math.
@@ -212,7 +212,7 @@ root_delay_ms      = upstream_root_delay_ms + measured_rtt_ms   // we are a stra
 ---
 
 ### Task P0-4: Time-quality envelope + `/status` + serve/stop policy (SLA)
-**Status:** todo **Priority:** P0 **Risk:** medium (touches hot path + cache; depends on P0-2)
+**Status:** done **Priority:** P0 **Risk:** medium (touches hot path + cache; depends on P0-2)
 
 **Affected files**
 - `src/http/handlers.rs` — `time_handler` (headers + policy), new `status_handler`, `time_full_handler`.
@@ -251,7 +251,7 @@ else                              -> 503 (hard stop)         unless ALLOW_DEGRAD
 ---
 
 ### Task P0-5: Real integration / E2E test harness + CI  (see §6 for file-level detail)
-**Status:** todo **Priority:** P0 **Risk:** low (additive)
+**Status:** done **Priority:** P0 **Risk:** low (additive)
 Summarized here; fully specified in **§6**. Adds `src/lib.rs`, `tests/common/mod.rs`, and
 `tests/e2e_*.rs`, plus a CI job. Acceptance: release pipeline runs unit → integration → live HTTP →
 live UDP → WS → metrics → `cargo build --release`, all green.
@@ -261,7 +261,7 @@ live UDP → WS → metrics → `cargo build --release`, all green.
 ## 3. Accuracy Model (concrete — Task P1-6)
 
 ### Task P1-6: Uncertainty-scored selection (weighted-median + quorum)
-**Status:** todo **Priority:** P1 **Risk:** medium-high (depends on P0-1/P0-2)
+**Status:** done **Priority:** P1 **Risk:** medium-high (depends on P0-1/P0-2)
 
 **Affected files:** `src/ntp/selection.rs` (algorithm + `Uncertainty`), `src/ntp/sync.rs`
 (gates + provider grouping), `src/ntp/stats.rs` (per-server offset ring buffer for jitter),
@@ -329,7 +329,7 @@ exposes `quorum_size`, `combined_uncertainty_ms`, `rejected_sources`, `single_pr
 8-sample clock filter — see next task.
 
 ### Task P1F-12: Interval-intersection / clock-combine robustness (follow-up to P1-6)
-**Status:** todo **Priority:** P1-followup **Risk:** medium-high (depends on P1-6)
+**Status:** done **Priority:** P1-followup **Risk:** medium-high (depends on P1-6)
 
 **Problem.** The P1-6 weighted-median can still **follow an independently-wrong majority** (multiple
 distinct providers that happen to agree on a wrong offset). Weighted median has no concept of "the
@@ -360,127 +360,377 @@ must increment when falsetickers are discarded.
 ## 4. Manual Override (full design — Task P1-7)
 
 ### Task P1-7: Secure manual time-override admin API
-**Status:** todo **Priority:** P1-high (P0/P1 boundary) **Risk:** HIGH (security + hot-path `TimeBase`) — isolated phase, dedicated security review.
+**Status:** todo **Priority:** P1-high (P0/P1 boundary) **Risk:** HIGH (security + hot-path `TimeBase`) — isolated phase, dedicated security review before merge.
 
-> **Priority note.** Manual override is a **core product requirement**, not optional future fluff. It
-> is sequenced after P0-4 **only** because it technically depends on the time-quality envelope (manual
-> mode must surface `source:"manual"` + a conservative uncertainty rather than impersonate NTP) and
-> because it needs a dedicated security review before merge. It is the **highest-priority P1** — begin
-> it as soon as P0-4 lands and a security reviewer is available.
+> **Priority note.** Manual override is a **core product requirement**, not optional future fluff.
+> Sequenced after P0-4 only because it depends on the time-quality envelope (manual mode must
+> surface `source:"manual"` rather than impersonate NTP) and requires a security review before merge.
+> Coding may start now; **merge requires sign-off from a security reviewer.**
 
-**Decisions (defaults, per prompt — all accepted):** disabled by default; `ADMIN_API_ENABLED=true`
-required; bearer `ADMIN_API_TOKEN` (constant-time); TTL required; reason required; max-jump enforced
-unless `MANUAL_OVERRIDE_ALLOW_FORCE=true`; responses expose `source:"manual"`; UDP Reference ID
-`MANU`; manual mode never impersonates normal NTP sync.
+---
 
-**Affected files:** `src/timebase.rs` (manual layer + precedence), `src/http/handlers_admin.rs`
-*(new)*, `src/http/mod.rs` (guarded `/admin` router), `src/http/middleware.rs` (auth + allowlist),
-`src/http/state.rs` (override state), `src/ntp/server.rs` (`MANU` + dispersion when manual),
-`src/config.rs`, `src/metrics.rs`.
+#### Security Contract (locked 2026-06-09 — implementation may begin)
 
-**TimeBase changes (read-path precedence: manual → NTP → unsynced)**
+All decisions below are final for the first implementation. Items marked **[hardening]** are
+deferred to a follow-up pass.
+
+---
+
+##### 1. Enablement
+
+| Decision | Value |
+|---|---|
+| Default | **Disabled** (`ADMIN_API_ENABLED=false`) |
+| When disabled | `/admin/*` routes are **not registered** — Axum returns 404 naturally. No explicit 404 handler needed. Do not return 401/403 (would expose admin surface). |
+| Startup validation | If `ADMIN_API_ENABLED=true` and `ADMIN_API_TOKEN` is empty/missing, **fail startup** with a clear error. |
+
+---
+
+##### 2. Authentication
+
+| Decision | Value |
+|---|---|
+| Mechanism | `Authorization: Bearer <token>` header only |
+| Comparison | Constant-time via `subtle::ConstantTimeEq` (add `subtle = "2"` to `[dependencies]`) |
+| Missing token | 401, minimal body: `{"status":401,"error":"Unauthorized","message":"error"}` |
+| Wrong token | 401, same body. Do **not** distinguish missing-vs-wrong (prevents oracle). |
+| Token logging | **Never log the token value.** No debug, trace, or error log may include `ADMIN_API_TOKEN` or the `Authorization` header. |
+| IP allowlist | **Deferred [hardening].** Not in first implementation. Add `ADMIN_IP_ALLOWLIST` (CIDR list) as follow-up if the service is exposed to untrusted networks. |
+| Rate limiting | Admin endpoints go on the **slow router**, which already has `GovernorLayer` when `DISABLE_RATE_LIMITING=false`. No separate rate limit needed. |
+| HMAC / mTLS | **Deferred [hardening].** Document as upgrade path; not required for first implementation. |
+
+**Auth middleware location:** `src/http/middleware.rs`, new `pub async fn require_admin_auth(...)`.
+Applied as a layer on the admin router only, not on the slow router globally.
+
+---
+
+##### 3. Endpoint Design
+
+| Endpoint | Method | Status |
+|---|---|---|
+| `/admin/time/override` | `POST` | **Implement** |
+| `/admin/time/override` | `GET` | **Implement** |
+| `/admin/time/override` | `DELETE` | **Implement** |
+| `/admin/sync/force` | `POST` | **Deferred** — requires a channel into `sync_loop`; not trivially addable without significant wiring |
+
+All admin endpoints live on a **dedicated admin router** merged into the main router, not added to `slow_router`. This isolates the auth layer.
+
+```
+Router = merge(fast_router, slow_router, admin_router) + CORS [+ GovernorLayer]
+admin_router = /admin/* routes + require_admin_auth layer
+```
+
+---
+
+##### 4. Request / Response Contract
+
+**POST /admin/time/override — request body**
+
+```json
+{
+  "epoch_ms": 1735459200000,
+  "reason": "NTP providers unreachable",
+  "ttl_seconds": 300,
+  "operator": "saman",
+  "force": false
+}
+```
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `epoch_ms` | `i64` | yes | any representable epoch |
+| `reason` | `String` | yes | non-empty, max 500 chars |
+| `ttl_seconds` | `u32` | yes | `1..=MANUAL_OVERRIDE_MAX_TTL_SECS` |
+| `operator` | `String` | no | free-form; for audit log only |
+| `force` | `bool` | no | default `false`; allows jump > `MAX_JUMP_MS` when `MANUAL_OVERRIDE_ALLOW_FORCE=true` |
+
+**POST 200 response**
+
+```json
+{
+  "status": 200,
+  "source": "manual",
+  "epoch_ms": 1735459200000,
+  "expires_at_ms": 1735459500000,
+  "jump_ms": 42,
+  "reason": "NTP providers unreachable",
+  "operator": "saman"
+}
+```
+
+**GET /admin/time/override — 200 when active**
+
+```json
+{
+  "status": 200,
+  "active": true,
+  "epoch_ms": 1735459200000,
+  "expires_at_ms": 1735459500000,
+  "set_at_ms": 1735459200000,
+  "reason": "NTP providers unreachable",
+  "operator": "saman"
+}
+```
+
+**GET when no override active:** `{"status":200,"active":false}`
+
+**DELETE 200 response:** `{"status":200,"source":"ntp","message":"override cleared"}`
+
+**400 error shape** (consistent with existing `AppError` JSON):
+```json
+{"status":400,"error":"<reason>","message":"error"}
+```
+
+---
+
+##### 5. Safety Bounds
+
+> **Note on defaults:** these differ from the initial plan. The defaults below are locked.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `MANUAL_OVERRIDE_MAX_TTL_SECS` | **300** (5 min) | Operators who need longer must explicitly raise this |
+| `MANUAL_OVERRIDE_MAX_JUMP_MS` | **5000** (5 s) | Tight default; large-jump scenarios require `ALLOW_FORCE=true` |
+| `MANUAL_OVERRIDE_ALLOW_FORCE` | **false** | Force must be explicitly enabled per-deployment |
+| `MANUAL_OVERRIDE_DISPERSION_MS` | **1000** | Baseline advertised dispersion when in manual mode |
+
+**Validation rules (400 if violated):**
+1. `ttl_seconds < 1` or `ttl_seconds > MANUAL_OVERRIDE_MAX_TTL_SECS` → `"ttl out of range"`
+2. `reason` empty or > 500 chars → `"reason required"`
+3. `|epoch_ms − now_ms| > MANUAL_OVERRIDE_MAX_JUMP_MS` AND NOT (`force == true` AND `MANUAL_OVERRIDE_ALLOW_FORCE == true`) → `"jump exceeds max; use force=true or raise MANUAL_OVERRIDE_MAX_JUMP_MS"`
+4. `force == true` AND `MANUAL_OVERRIDE_ALLOW_FORCE == false` → `"force not allowed by server configuration"`
+
+**Monotonic rule — NO EXCEPTIONS:**
+`last_served_ms` CAS applies to manual time, NTP time, and the transition between them. `now_ms()` always returns `max(computed_ms, last_served_ms + 1)` when `MONOTONIC_OUTPUT=true`. If an operator sets a manual epoch in the past, served time will be `last_served_ms + 1` (clamp), not the requested epoch. This is the correct and safe behavior. **There is no bypass.** Document this in the error response if the jump would result in no visible effect (jump_ms < 0 after clamp).
+
+---
+
+##### 6. Source Behavior While Active
+
+**TimeBase additions (4 new atomics):**
 ```rust
 manual_active: Arc<AtomicBool>,
 manual_base_epoch_ms: Arc<AtomicI64>,
-manual_base_instant_nanos: Arc<AtomicU64>,
-manual_expires_at_nanos: Arc<AtomicU64>,   // absolute, since REFERENCE_INSTANT
-// now_ms(): if manual_active && now < expires -> manual base+elapsed; else if has_synced -> NTP; else None.
-// Monotonic clamp (last_served_ms) applies to the FINAL value regardless of source -> no backward jump on enter/exit/expiry.
+manual_base_instant_nanos: Arc<AtomicU64>,  // nanos since REFERENCE_INSTANT at set time
+manual_expires_at_nanos: Arc<AtomicU64>,    // absolute deadline, nanos since REFERENCE_INSTANT
 ```
 
-**Endpoints (slow router only, behind admin guard + rate limit)**
-- `POST /admin/time/override` — body `{ epoch_ms, reason, ttl_seconds, force }`
-- `DELETE /admin/time/override` — revert to NTP
-- `GET /admin/time/override` — current state
-- `POST /admin/sync/force` — trigger immediate upstream sync
-
-**Auth model (D6):** `ADMIN_API_ENABLED` gate → else 404. `Authorization: Bearer <token>` compared
-with constant-time eq (`subtle::ConstantTimeEq`); optional CIDR allowlist `ADMIN_API_ALLOWLIST`;
-slow-router rate limit. Token never logged. HMAC/mTLS documented as hardening.
-
-**Env vars**
+**`now_ms()` read precedence: manual → NTP → unsynced**
 ```
-ADMIN_API_ENABLED=false  ADMIN_API_TOKEN=<secret>  ADMIN_API_ALLOWLIST=""(CIDRs)
-MANUAL_OVERRIDE_MAX_TTL_SECS=3600  MANUAL_OVERRIDE_MAX_JUMP_MS=60000
-MANUAL_OVERRIDE_ALLOW_FORCE=false  MANUAL_OVERRIDE_DISPERSION_MS=1000
+if manual_active AND now_nanos < manual_expires_at_nanos:
+    ms = manual_base_epoch_ms + (now_nanos - manual_base_instant_nanos) / 1_000_000
+    apply monotonic clamp
+    return Some(ms)
+else if manual_active AND now_nanos >= expires_at_nanos:
+    manual_active.store(false)   // lazy safety backstop; background task is primary clearer
+    fall through to NTP path
+NTP path (existing): has_synced → base_epoch_ms + elapsed; else None
 ```
 
-**Request / Response JSON**
-```jsonc
-// POST /admin/time/override
-{ "epoch_ms": 1735459200000, "reason": "NTP providers unreachable", "ttl_seconds": 300, "force": false }
-// 200
-{ "status": 200, "source": "manual", "epoch_ms": 1735459200000,
-  "expires_at_ms": 1735459500000, "reason": "NTP providers unreachable", "operator": "<token-id|ip>" }
+**`TimeQuality` extension** — add to the existing struct:
+```rust
+pub override_info: Option<OverrideInfo>,
+```
+```rust
+pub struct OverrideInfo {
+    pub reason: String,
+    pub operator: Option<String>,
+    pub expires_at_ms: i64,
+    pub set_at_ms: i64,
+}
 ```
 
-**Validation:** `1 <= ttl_seconds <= MANUAL_OVERRIDE_MAX_TTL_SECS`; `reason` non-empty;
-`|epoch_ms − now_ms| <= MANUAL_OVERRIDE_MAX_JUMP_MS` unless `force && MANUAL_OVERRIDE_ALLOW_FORCE`
-(else 400). TTL expiry auto-reverts to NTP without backward jump.
+**`compute_quality()` when manual active:**
+```
+source       = "manual"
+serve_state  = "ok"   (operator takes explicit responsibility; SLA thresholds do not apply)
+uncertainty_ms = Some(dispersion_ms_at_age(age_ms))  // grows with age, same PHI formula
+staleness_ms = None   (not applicable to manual)
+stratum      = Some(2)
+override_info = Some(OverrideInfo { ... })
+```
 
-**Behavior surfaces**
-- `/time`: served value = manual; header `X-Time-Source: manual`. Body adds `source` only via
-  `/time/full` (D3).
-- `/performance` & `/status`: `source:"manual"`, `expires_at_ms`, `reason`, `operator`.
-- UDP NTP: Stratum 2, `LI=0`, Reference ID `MANU`, `root_dispersion = MANUAL_OVERRIDE_DISPERSION_MS`
-  (conservative), `root_delay = 0` (no upstream). (D1)
+**`time_source_mode` metric encoding** (extend existing gauge): 0=ntp, 1=degraded, 2=unsynced, **3=manual**.
 
-**Audit logging:** structured event per action — `action`, `operator`, `source_ip`, `old_epoch`,
-`new_epoch`, `delta_ms`, `reason`, `ttl`, `force`, `result`. Emit at `warn` so it's never filtered.
+**HTTP / WebSocket surfaces:**
+- `/time`: `X-Time-Source: manual`; body unchanged (backward-compat)
+- `/time/full`: `source: "manual"`, `expires_at_ms`, `reason`, `operator` in body
+- `/status`: `source: "manual"`, full `override_info` block
+- WebSocket ticks: `source: "manual"` via `compute_quality()` — no extra code needed
 
-**Metrics:** `time_source_mode{mode="ntp|manual|degraded|unsynced"}`, `manual_override_active` (0/1),
-`manual_override_expiry_timestamp_seconds`, `manual_override_total` (counter).
+**UDP NTP server when manual active:**
+- Reference ID: `MANU` = `u32::from_be_bytes(*b"MANU")`
+- Stratum: 2
+- LI: 0 (we are serving time; leap indicator is not alarm)
+- `root_delay`: 0 (no upstream network path in manual mode)
+- `root_dispersion`: `MANUAL_OVERRIDE_DISPERSION_MS + PHI * age_s * 1000` (conservative, grows with age), clamped to `max_root_dispersion_ms`
+- Transmit / reference timestamps: derived from manual epoch
 
-**Security risks & mitigations**
-- token leak → never log; constant-time compare; allowlist; rate limit.
-- replay → offer HMAC(body+timestamp) variant; short TTL.
-- accidental enable → disabled by default + explicit env + 404 when disabled.
-- malicious huge jump → max-jump bound; force gated by separate env.
-- DoS on admin path → slow-router rate limit.
+The `NtpServer::handle_request` / `build_response` receives `Option<&SyncQuality>` today. This is extended to also receive `Option<&ManualOverrideState>` (or a richer enum `TimeSource { Ntp(SyncQuality), Manual(ManualOverrideState), Unsynced }`).
 
-**Tests (`tests/e2e_manual_override.rs` + `src/timebase.rs` units)**
-disabled-by-default→404; missing/wrong token→401/403; allowlist enforced; set→`/time`+`/status`+UDP
-reflect manual & `MANU`; clear→back to NTP; TTL expiry auto-reverts (no backward jump); jump>max→400;
-force allowed only when configured; rate-limited; audit log emitted; monotonic preserved across
-enter/exit/expiry.
+---
 
-**Acceptance criteria:** all tests green; manual mode unmistakable in HTTP + UDP; never advertises
-as normal NTP; bounded, TTL'd, audited; default-off verified.
+##### 7. Expiry Mechanism
+
+**Two-layer design (belt and suspenders):**
+
+1. **Background task (primary, authoritative):** When `POST /admin/time/override` is called, spawn a `tokio::time::sleep_until(expires_at)` task. Store `AbortHandle` in `AppState.override_task: Arc<parking_lot::Mutex<Option<AbortHandle>>>`. On wakeup: clear `manual_active`, emit audit log (`action="expire"`), update metrics. On `DELETE`: abort the task, clear state, emit audit log (`action="clear"`). On a new `POST` over an existing override: abort previous task, set new state, spawn new task.
+
+2. **`now_ms()` lazy check (safety backstop):** If `manual_active=true` and current time ≥ `expires_at_nanos`, store `false` to `manual_active`. No audit log from here (to keep the hot path clean). The background task will still fire and emit the audit log (the `manual_active.store(false)` from `now_ms()` is idempotent with the background task's clear).
+
+**`AppState` additions:**
+```rust
+pub override_state: Arc<parking_lot::RwLock<Option<ManualOverrideState>>>,
+pub override_task: Arc<parking_lot::Mutex<Option<tokio::task::AbortHandle>>>,
+```
+```rust
+pub struct ManualOverrideState {
+    pub epoch_ms: i64,
+    pub set_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub reason: String,
+    pub operator: Option<String>,
+}
+```
+
+**Expiry behavior:**
+- After expiry: if NTP `has_synced`, returns to NTP mode automatically
+- If NTP unavailable at expiry time: falls through to unsynced/stopped policy per existing rules
+- Monotonic clamp applies across the manual→NTP transition: no backward jump
+
+---
+
+##### 8. Audit / Logging
+
+All audit events use `tracing::warn!` (never filtered in production) with structured fields.
+
+**Event on SET:**
+```
+action="set", operator=<str|"unknown">, source_ip=<ip>, old_source=<ntp|unsynced|manual>,
+new_source="manual", old_epoch_ms=<i64|null>, new_epoch_ms=<i64>, jump_ms=<i64>,
+reason=<str>, ttl_secs=<u32>, force=<bool>, expires_at_ms=<i64>
+```
+
+**Event on CLEAR (DELETE):**
+```
+action="clear", operator=<str|"unknown">, source_ip=<ip>, old_source="manual",
+new_source=<ntp|unsynced>, was_epoch_ms=<i64>, reason=<original-reason>
+```
+
+**Event on EXPIRE (background task):**
+```
+action="expire", was_epoch_ms=<i64>, was_reason=<str>, was_operator=<str|null>,
+new_source=<ntp|unsynced>
+```
+
+**Never log:** the token value, the `Authorization` header, or any substring that could contain the token.
+
+---
+
+##### 9. Metrics
+
+Four new metrics added to `src/metrics.rs`:
+
+| Metric | Type | Description |
+|---|---|---|
+| `manual_override_active` | `Gauge` | 1 when manual override active, 0 otherwise |
+| `manual_override_total` | `Counter` | Total number of successful overrides set |
+| `manual_override_expiry_timestamp_seconds` | `Gauge<f64>` | Unix epoch seconds of current override expiry; 0 when none |
+| `manual_override_rejected_total{reason}` | `Family<RejectLabel, Counter>` | Rejection counts; `reason` label values: `ttl_exceeded`, `jump_exceeded`, `force_not_allowed`, `bad_token`, `validation_error` |
+
+The existing `time_source_mode` gauge encoding is extended: **3 = manual** (was: 0=ntp, 1=degraded, 2=unsynced).
+
+---
+
+##### 10. Test Requirements (`tests/e2e_manual_override.rs`)
+
+All 20 tests required before merge:
+
+| # | Test | Notes |
+|---|---|---|
+| 1 | `disabled_returns_404` | `ADMIN_API_ENABLED=false`; all three endpoints → 404 |
+| 2 | `enabled_no_token_returns_401` | `ADMIN_API_ENABLED=true`, no `Authorization` header |
+| 3 | `enabled_wrong_token_returns_401` | Wrong bearer value; same 401 body as missing |
+| 4 | `set_override_succeeds_with_good_token` | POST → 200; response has `epoch_ms`, `expires_at_ms` |
+| 5 | `get_shows_active_override` | GET after POST → `active: true` + metadata |
+| 6 | `delete_clears_override` | DELETE → 200; GET after → `active: false` |
+| 7 | `ttl_expiry_clears_override` | Short TTL (1 s); after sleep → GET returns `active: false` |
+| 8 | `max_ttl_rejected` | `ttl_seconds > MAX_TTL` → 400 `ttl out of range` |
+| 9 | `max_jump_rejected` | `|epoch_ms - now_ms| > MAX_JUMP` → 400 |
+| 10 | `force_rejected_when_not_allowed` | `force=true` + `ALLOW_FORCE=false` → 400 |
+| 11 | `force_allowed_when_configured` | `force=true` + `ALLOW_FORCE=true` + large jump → 200 |
+| 12 | `time_source_header_is_manual` | `/time` → `X-Time-Source: manual` while override active |
+| 13 | `time_full_source_is_manual` | `/time/full` body `source == "manual"` |
+| 14 | `status_exposes_override_metadata` | `/status` has `override_info.reason`, `expires_at_ms` |
+| 15 | `websocket_tick_source_is_manual` | WS `source` field = `"manual"` while override active |
+| 16 | `udp_ntp_uses_manu_refid` | UDP reply `reference_id == u32::from_be_bytes(*b"MANU")` |
+| 17 | `monotonic_preserved_across_manual_exit` | Time after DELETE ≥ last served time before DELETE |
+| 18 | `monotonic_preserved_on_ttl_expiry` | Time after TTL ≥ last served time during manual mode |
+| 19 | `audit_log_does_not_contain_token` | `tracing_subscriber::fmt` output checked; token absent |
+| 20 | `get_returns_not_active_before_any_set` | GET on fresh server → `active: false` |
+
+---
+
+##### 11. Affected Files
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | Add `subtle = "2"` to `[dependencies]` |
+| `src/config.rs` | Add `AdminConfig` struct + env-var parsing |
+| `src/timebase.rs` | Add 4 manual atomic fields; update `now_ms()` for manual precedence |
+| `src/http/state.rs` | Add `ManualOverrideState`, `OverrideInfo`; extend `TimeQuality`; update `compute_quality()` |
+| `src/http/mod.rs` | Add conditional `admin_router`; mount it |
+| `src/http/middleware.rs` | Add `require_admin_auth` middleware |
+| `src/http/handlers_admin.rs` | *(new)* GET / POST / DELETE handlers |
+| `src/ntp/server.rs` | Add MANU mode to `build_response` |
+| `src/metrics.rs` | Add 4 new metrics; extend `time_source_mode` encoding |
+| `tests/e2e_manual_override.rs` | *(new)* 20 E2E tests |
+
+---
+
+**Acceptance criteria:** all 20 tests green; manual mode unmistakable in HTTP + UDP + WebSocket;
+never advertises as normal NTP; bounded by TTL and jump limits; audited at warn level (no token);
+default-off behavior verified; monotonic guarantee holds across every transition.
+
+**Remaining human approval before merge:** security review of the implementation diff.
 
 ---
 
 ## 5. HA / Replica Drift (actionable — Task P1-8)
 
 ### Task P1-8: Replica-drift visibility (no cross-replica consensus)
-**Status:** todo **Priority:** P1 **Risk:** low
+**Status:** **done** **Priority:** P1 **Risk:** low
 
 **Decision:** do **not** build consensus/leader election (adds a worse SPOF). Make shared-nothing
 replicas’ disagreement **observable and gated**.
 
-**Affected files:** `src/http/handlers.rs` (`/status` + readiness gate), `src/config.rs`
-(`REPLICA_ID`, `READINESS_MAX_UNCERTAINTY_MS`), `src/metrics.rs`, `k8s/prometheus-rules.yaml`
-*(new)*, `PROJECT_ARCHITECTURE.md` (document the decision).
+> **Note:** The basic `/readyz` uncertainty gate (`READINESS_MAX_UNCERTAINTY_MS`) was implemented in
+> **P0-4** and is already live. P1-8 focuses on per-replica *observability* and inter-replica spread
+> alerting — not the gate itself.
+
+**Affected files:** `src/http/handlers.rs` (`/status` replica fields), `src/config.rs`
+(`REPLICA_ID`), `src/metrics.rs`, `k8s/prometheus-rules.yaml` *(new)*,
+`PROJECT_ARCHITECTURE.md` (document the decision).
 
 **Tasks**
 1. `REPLICA_ID` env (default = hostname). Expose in `/status` and as metric label.
 2. Metrics: `time_replica_info{replica_id,selected_server,source}=1`,
-   `time_offset_milliseconds`, `time_uncertainty_milliseconds`.
+   `time_offset_milliseconds` (per replica).
+   (`time_uncertainty_milliseconds` already emitted — added in P0-4.)
 3. `/status` exposes: `replica_id`, `source`, `selected_server`, `selected_provider`,
    `uncertainty_ms`, `staleness_ms`, `quorum_size`.
-4. Readiness gate: `/readyz` returns 503 when `uncertainty_ms > READINESS_MAX_UNCERTAINTY_MS`
-   (D8 default 250) → LB drops the diverged replica gracefully.
-5. `k8s/prometheus-rules.yaml`: alert on inter-replica spread
+4. `k8s/prometheus-rules.yaml`: alert on inter-replica spread
    `max(time_offset_milliseconds) − min(time_offset_milliseconds) > THRESHOLD`.
-6. Deployment guidance (docs): identical `NTP_SERVERS` across replicas; any LB algorithm is fine
+5. Deployment guidance (docs): identical `NTP_SERVERS` across replicas; any LB algorithm is fine
    because drift is bounded + observable; no quorum/odd-count requirement.
 
 **Tests**
 - `/status` includes `replica_id` + uncertainty.
-- readiness flips to 503 when injected uncertainty exceeds threshold; back to 200 below.
 - metric emitted with labels.
 
 **Acceptance criteria:** operators can detect two replicas disagreeing via a single Prometheus
-expression; a too-uncertain replica is removed from rotation automatically.
+expression; a too-uncertain replica is removed from rotation automatically via the P0-4 readiness
+gate.
 
 ---
 

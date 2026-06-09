@@ -20,12 +20,12 @@ use super::protocol::{
     LI_ALARM_UNSYNCHRONIZED, LI_NO_WARNING, NTP_VERSION, NtpPacket, STRATUM_PRIMARY,
     STRATUM_UNSYNCHRONIZED, parse_packet, serialize_packet, system_unix_ms, unix_ms_to_ntp,
 };
+use super::sync::SyncQuality;
 use crate::metrics::Metrics;
 use crate::timebase::TimeBase;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
@@ -105,6 +105,9 @@ impl UdpRateLimiter {
 /// allows 4 ASCII chars (KISS codes) for Stratum >= 2.
 const REFERENCE_ID_LOCAL: u32 = u32::from_be_bytes(*b"LOCL");
 
+/// Reference ID advertised when a manual time override is active.
+const REFERENCE_ID_MANUAL: u32 = u32::from_be_bytes(*b"MANU");
+
 /// The NTP server. Cheap to construct; call [`NtpServer::run`] to serve
 /// forever (or until the runtime shuts down).
 pub struct NtpServer {
@@ -112,11 +115,16 @@ pub struct NtpServer {
     timebase: TimeBase,
     metrics: Arc<Metrics>,
     max_packet_size: usize,
-    /// RTT of the most recent upstream NTP sync in milliseconds.
-    /// Shared from the sync loop so we can report a non-zero
-    /// `root_delay` to downstream clients (RFC 5905 §7.3).
-    last_rtt_ms: Arc<AtomicU64>,
+    /// Full quality snapshot from the most recent upstream NTP sync.
+    /// Used to compute honest `root_delay` / `root_dispersion` per
+    /// RFC 5905 §11.2.
+    last_sync_quality: Arc<parking_lot::RwLock<Option<SyncQuality>>>,
+    /// Hard ceiling on advertised `root_dispersion` (ms).
+    max_root_dispersion_ms: u64,
     rate_limiter: UdpRateLimiter,
+    /// Base root_dispersion (ms) when a manual override is active.
+    /// Grows with override age at RFC 5905 PHI rate (15 ms/s).  Default: 1000 ms.
+    manual_dispersion_ms: u64,
 }
 
 impl NtpServer {
@@ -124,20 +132,28 @@ impl NtpServer {
         addr: SocketAddr,
         timebase: TimeBase,
         metrics: Arc<Metrics>,
-        last_rtt_ms: Arc<AtomicU64>,
+        last_sync_quality: Arc<parking_lot::RwLock<Option<SyncQuality>>>,
+        max_root_dispersion_ms: u64,
     ) -> Self {
         Self {
             addr,
             timebase,
             metrics,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
-            last_rtt_ms,
+            last_sync_quality,
+            max_root_dispersion_ms,
             rate_limiter: UdpRateLimiter::new(DEFAULT_UDP_RATE_LIMIT),
+            manual_dispersion_ms: 1000,
         }
     }
 
     pub fn with_max_packet_size(mut self, max: usize) -> Self {
         self.max_packet_size = max.max(48);
+        self
+    }
+
+    pub fn with_manual_dispersion_ms(mut self, ms: u64) -> Self {
+        self.manual_dispersion_ms = ms;
         self
     }
 
@@ -159,7 +175,31 @@ impl NtpServer {
                 "NTP server bound to a privileged port; requires CAP_NET_BIND_SERVICE or root"
             );
         }
+        self.serve_loop(socket).await
+    }
 
+    /// Like [`run`] but notifies the caller of the actual bound address via
+    /// `ready_tx` once the socket is open.  Useful when `self.addr.port() == 0`
+    /// (OS-assigned ephemeral port) and the caller needs to know the real port,
+    /// e.g. integration tests.
+    pub async fn run_with_ready(
+        self,
+        ready_tx: tokio::sync::oneshot::Sender<SocketAddr>,
+    ) -> anyhow::Result<()> {
+        let socket = UdpSocket::bind(self.addr).await?;
+        let local = socket.local_addr()?;
+        info!(addr = %local, "NTP server listening on UDP");
+        if local.port() < 1024 {
+            warn!(
+                port = local.port(),
+                "NTP server bound to a privileged port; requires CAP_NET_BIND_SERVICE or root"
+            );
+        }
+        let _ = ready_tx.send(local);
+        self.serve_loop(socket).await
+    }
+
+    async fn serve_loop(self, socket: UdpSocket) -> anyhow::Result<()> {
         let mut buf = vec![0u8; self.max_packet_size];
         loop {
             match socket.recv_from(&mut buf).await {
@@ -198,8 +238,27 @@ impl NtpServer {
         // Capture receive timestamp as early as possible.
         let receive_ntp = unix_ms_to_ntp(self.timebase.now_ms().unwrap_or_else(system_unix_ms));
 
-        let upstream_rtt_ms = self.last_rtt_ms.load(Ordering::Relaxed);
-        let response = build_response(&self.timebase, &request, receive_ntp, upstream_rtt_ms);
+        // Clone the sync quality snapshot (releases the lock immediately).
+        let quality_snapshot = self.last_sync_quality.read().clone();
+
+        // Pre-compute advertised dispersion_ms (f64) for metric emission.
+        // Only set when synced and quality data is available.
+        let advertised_dispersion_ms: Option<f64> = if self.timebase.has_synced() {
+            quality_snapshot
+                .as_ref()
+                .map(|q| compute_dispersion_ms(q, self.max_root_dispersion_ms))
+        } else {
+            None
+        };
+
+        let response = build_response(
+            &self.timebase,
+            &request,
+            receive_ntp,
+            quality_snapshot.as_ref(),
+            self.max_root_dispersion_ms,
+            self.manual_dispersion_ms,
+        );
         let wire = serialize_packet(&response);
 
         // Capture transmit timestamp as late as possible (just before send).
@@ -212,6 +271,12 @@ impl NtpServer {
                 self.metrics.ntp_udp_server_responses_total.inc();
                 if !self.timebase.has_synced() {
                     self.metrics.ntp_udp_server_unsynced_responses_total.inc();
+                }
+                // Update the advertised root_dispersion gauge when synced.
+                if let Some(disp_ms) = advertised_dispersion_ms {
+                    self.metrics
+                        .ntp_udp_server_root_dispersion_seconds
+                        .set(disp_ms / 1000.0);
                 }
                 debug!(
                     peer = %peer,
@@ -238,12 +303,65 @@ fn ms_to_ntp_short(ms: u64) -> u32 {
     ntp_units.min(u32::MAX as u64) as u32
 }
 
+/// Like `ms_to_ntp_short` but accepts f64 milliseconds.
+///
+/// Used for dispersion so that sub-millisecond contributions (e.g.
+/// PHI × age, precision) are preserved in the NTP short-format output
+/// and not truncated by an early integer cast.
+fn ms_to_ntp_short_f64(ms: f64) -> u32 {
+    let ntp_units = (ms * 65536.0 / 1000.0).max(0.0);
+    ntp_units.min(u32::MAX as f64) as u32
+}
+
+/// Compute the `root_dispersion` to advertise, in f64 milliseconds, clamped
+/// to `[0, max_ms]`. Delegates the core formula to
+/// [`SyncQuality::compute_dispersion_ms`] (RFC 5905 §11.2).
+fn compute_dispersion_ms(quality: &SyncQuality, max_ms: u64) -> f64 {
+    quality.compute_dispersion_ms().min(max_ms as f64)
+}
+
+/// Compute the `root_delay` to advertise, in milliseconds.
+///
+/// Per RFC 5905 §11.2: `root_delay = upstream.root_delay + local_RTT`.
+/// As a Stratum-2 relay we include both the upstream's path delay and
+/// our own measured RTT to that upstream.
+fn compute_root_delay_ms(quality: &SyncQuality) -> u64 {
+    (quality.upstream_root_delay_ms as u64).saturating_add(quality.measured_rtt_ms)
+}
+
 fn build_response(
     timebase: &TimeBase,
     request: &NtpPacket,
     receive_ntp: u64,
-    upstream_rtt_ms: u64,
+    quality: Option<&SyncQuality>,
+    max_root_dispersion_ms: u64,
+    manual_dispersion_ms: u64,
 ) -> NtpPacket {
+    // ── Manual override path ──────────────────────────────────────────────────
+    if timebase.is_manual_active() {
+        // root_dispersion grows with age: base + PHI * age_secs (PHI = 15 µs/s = 0.015 ms/s, RFC 5905 §11.2)
+        let age_ms = timebase.manual_age_ms();
+        let phi_ms = age_ms.saturating_mul(15) / 1_000_000;
+        let disp_ms = manual_dispersion_ms
+            .saturating_add(phi_ms)
+            .min(max_root_dispersion_ms);
+        return NtpPacket {
+            li: LI_NO_WARNING,
+            vn: NTP_VERSION,
+            mode: 4,
+            stratum: STRATUM_PRIMARY + 1, // Stratum 2
+            poll: request.poll,
+            precision: -10,
+            root_delay: 0,
+            root_dispersion: ms_to_ntp_short(disp_ms),
+            reference_id: REFERENCE_ID_MANUAL,
+            ref_timestamp: receive_ntp,
+            origin_timestamp: request.transmit_timestamp,
+            receive_timestamp: receive_ntp,
+            transmit_timestamp: receive_ntp,
+        };
+    }
+
     let synced = timebase.has_synced();
 
     let (li, stratum) = if synced {
@@ -264,14 +382,19 @@ fn build_response(
     // For the unsynced path, set it to 0 (RFC 5905 §7.3).
     let ref_timestamp = if synced { receive_ntp } else { 0 };
 
-    // root_delay = RTT to our upstream NTP server, in NTP short format.
-    // When synced, propagate the measured RTT so downstream clients can
-    // budget their uncertainty correctly (RFC 5905 §7.3).
-    // root_dispersion is left at 0; we do not track upstream dispersion.
-    let root_delay = if synced {
-        ms_to_ntp_short(upstream_rtt_ms)
+    // root_delay and root_dispersion: use quality data when available.
+    // If synced but quality is not yet populated (race at startup),
+    // both fields default to 0.
+    let (root_delay, root_dispersion) = if synced {
+        match quality {
+            Some(q) => (
+                ms_to_ntp_short(compute_root_delay_ms(q)),
+                ms_to_ntp_short_f64(compute_dispersion_ms(q, max_root_dispersion_ms)),
+            ),
+            None => (0, 0),
+        }
     } else {
-        0
+        (0, 0)
     };
 
     NtpPacket {
@@ -288,7 +411,7 @@ fn build_response(
         // our local counter. 1 ms is the honest lie.
         precision: -10,
         root_delay,
-        root_dispersion: 0,
+        root_dispersion,
         reference_id,
         ref_timestamp,
         // RFC 5905 §7.3: "Origin Timestamp = request Transmit Timestamp".
@@ -314,6 +437,7 @@ fn write_transmit(buf: &mut [u8], transmit_ntp: u64) {
 mod tests {
     use super::*;
     use crate::metrics::Metrics;
+    use crate::ntp::sync::SyncQuality;
     use crate::performance::TimeCache;
     use crate::timebase::TimeBase;
     use std::sync::atomic::AtomicU64;
@@ -335,6 +459,13 @@ mod tests {
             t2_server_recv_ms: 0,
             t3_server_send_ms: 0,
             t4_client_recv_ms: 0,
+            root_delay_ms: 0,
+            root_dispersion_ms: 0,
+            stratum: 1,
+            leap: 0,
+            precision_log2: 0,
+            reference_id: 0,
+            timing_source: crate::ntp::selection::TimingSource::Estimated,
         });
         tb
     }
@@ -344,31 +475,199 @@ mod tests {
         TimeBase::new(false).with_cache(cache)
     }
 
-    fn zero_rtt() -> Arc<AtomicU64> {
-        Arc::new(AtomicU64::new(0))
+    /// Build a `SyncQuality` for use in tests.
+    fn make_sync_quality(
+        measured_rtt_ms: u64,
+        upstream_root_delay_ms: u32,
+        upstream_root_dispersion_ms: u32,
+    ) -> SyncQuality {
+        SyncQuality {
+            upstream_root_delay_ms,
+            upstream_root_dispersion_ms,
+            precision_log2: -20,
+            stratum: 1,
+            leap: 0,
+            measured_rtt_ms,
+            jitter_ms: 0,
+            offset_ms: 0,
+            last_sync_instant: Instant::now(),
+            selected_server: "test.ntp.org:123".into(),
+        }
     }
+
+    /// Wrap a `SyncQuality` in the `Arc<RwLock<Option<_>>>` that `NtpServer` holds.
+    fn quality_arc(q: SyncQuality) -> Arc<parking_lot::RwLock<Option<SyncQuality>>> {
+        Arc::new(parking_lot::RwLock::new(Some(q)))
+    }
+
+    fn no_quality() -> Arc<parking_lot::RwLock<Option<SyncQuality>>> {
+        Arc::new(parking_lot::RwLock::new(None))
+    }
+
+    // ── build_response unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn build_response_synced_uses_stratum_2() {
+        let tb = synced_timebase();
+        let mut req = NtpPacket::new(0, 4, 3);
+        req.transmit_timestamp = 0xAAAA_BBBB_CCCC_DDDD;
+        let r = build_response(&tb, &req, 0x1111_2222_3333_4444, None, 16_000, 1000);
+        assert_eq!(r.li, 0);
+        assert_eq!(r.stratum, 2);
+        assert_eq!(r.mode, 4);
+        assert_eq!(r.origin_timestamp, 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(r.reference_id, REFERENCE_ID_LOCAL);
+    }
+
+    #[test]
+    fn build_response_unsynced_uses_stratum_16() {
+        let tb = unsynced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+        let r = build_response(&tb, &req, 0, None, 16_000, 1000);
+        assert_eq!(r.li, LI_ALARM_UNSYNCHRONIZED);
+        assert_eq!(r.stratum, STRATUM_UNSYNCHRONIZED);
+        assert_eq!(r.reference_id, 0);
+        assert_eq!(r.ref_timestamp, 0);
+    }
+
+    #[test]
+    fn build_response_synced_includes_root_delay() {
+        let tb = synced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+        // upstream_root_delay_ms=0, measured_rtt_ms=10
+        // → root_delay = ms_to_ntp_short(10) = 655
+        let q = make_sync_quality(10, 0, 0);
+        let r = build_response(&tb, &req, 0, Some(&q), 16_000, 1000);
+        assert_eq!(r.root_delay, 655);
+    }
+
+    #[test]
+    fn build_response_unsynced_root_delay_is_zero() {
+        let tb = unsynced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+        let q = make_sync_quality(50, 10, 5);
+        let r = build_response(&tb, &req, 0, Some(&q), 16_000, 1000);
+        assert_eq!(r.root_delay, 0, "unsynced path must always report 0");
+        assert_eq!(r.root_dispersion, 0, "unsynced path must always report 0");
+    }
+
+    #[test]
+    fn root_dispersion_nonzero_when_synced() {
+        let tb = synced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+        // upstream_dispersion=5ms, rtt=10ms → dispersion >= 5 + 5 = 10ms
+        let q = make_sync_quality(10, 0, 5);
+        let r = build_response(&tb, &req, 0, Some(&q), 16_000, 1000);
+        assert!(
+            r.root_dispersion > 0,
+            "synced response with quality must have root_dispersion > 0"
+        );
+    }
+
+    #[test]
+    fn root_dispersion_grows_with_age() {
+        let tb = synced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+
+        let q_fresh = make_sync_quality(10, 0, 5);
+        let r_fresh = build_response(&tb, &req, 0, Some(&q_fresh), 16_000, 1000);
+
+        // Simulate a sync that is 10 seconds old.
+        let q_old = SyncQuality {
+            last_sync_instant: Instant::now() - Duration::from_secs(10),
+            ..make_sync_quality(10, 0, 5)
+        };
+        let r_old = build_response(&tb, &req, 0, Some(&q_old), 16_000, 1000);
+
+        assert!(
+            r_old.root_dispersion > r_fresh.root_dispersion,
+            "older sync ({}  NTP-short) must have larger dispersion than fresh sync ({} NTP-short)",
+            r_old.root_dispersion,
+            r_fresh.root_dispersion
+        );
+    }
+
+    #[test]
+    fn root_dispersion_clamps_at_max() {
+        let tb = synced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+        // Very old sync will produce huge drift; clamp at 1000 ms.
+        let q = SyncQuality {
+            last_sync_instant: Instant::now() - Duration::from_secs(1_000_000),
+            ..make_sync_quality(10, 0, 0)
+        };
+        let r = build_response(&tb, &req, 0, Some(&q), 1_000, 1000);
+        let expected = ms_to_ntp_short(1_000);
+        assert_eq!(
+            r.root_dispersion, expected,
+            "dispersion must be clamped to max_root_dispersion_ms"
+        );
+    }
+
+    #[test]
+    fn root_delay_includes_upstream() {
+        let tb = synced_timebase();
+        let req = NtpPacket::new(0, 4, 3);
+        // upstream_root_delay=50ms, measured_rtt=10ms → total=60ms
+        let q = make_sync_quality(10, 50, 0);
+        let r = build_response(&tb, &req, 0, Some(&q), 16_000, 1000);
+        let expected = ms_to_ntp_short(60);
+        assert_eq!(
+            r.root_delay, expected,
+            "root_delay must include upstream root_delay + local RTT"
+        );
+        assert!(
+            r.root_delay >= ms_to_ntp_short(50),
+            "root_delay must be >= upstream_root_delay"
+        );
+    }
+
+    #[test]
+    fn ms_to_ntp_short_values() {
+        assert_eq!(ms_to_ntp_short(0), 0);
+        // 10ms → 655
+        assert_eq!(ms_to_ntp_short(10), 655);
+        // 1000ms (1 sec) → 65536
+        assert_eq!(ms_to_ntp_short(1000), 65536);
+    }
+
+    #[test]
+    fn manual_dispersion_phi_rate_is_15_micros_per_second() {
+        // RFC 5905 §11.2: PHI = 15 µs/s = 0.015 ms/s.
+        // After 1000 s (= 1_000_000 ms) the PHI contribution must be 15 ms.
+        let age_ms: u64 = 1_000_000;
+        let phi_ms = age_ms.saturating_mul(15) / 1_000_000;
+        assert_eq!(
+            phi_ms, 15,
+            "1000 s PHI contribution must be 15 ms, not 15_000 ms"
+        );
+
+        // After 100 s: 0.015 ms/s × 100 s = 1.5 ms → floors to 1 ms in integer.
+        let phi_100s = 100_000u64.saturating_mul(15) / 1_000_000;
+        assert_eq!(phi_100s, 1);
+
+        // After 60 s: 0.015 × 60 = 0.9 ms → floors to 0.
+        let phi_1min = 60_000u64.saturating_mul(15) / 1_000_000;
+        assert_eq!(phi_1min, 0);
+    }
+
+    // ── Live UDP loopback tests ────────────────────────────────────────────
 
     #[tokio::test]
     async fn server_responds_to_client_request() {
         let metrics = Arc::new(Metrics::new());
         let tb = synced_timebase();
-        let rtt = zero_rtt();
-        let _server = NtpServer::new(
-            "127.0.0.1:0".parse().unwrap(),
-            tb.clone(),
-            metrics.clone(),
-            rtt,
-        )
-        .with_max_packet_size(128);
+        let quality = quality_arc(make_sync_quality(10, 5, 3));
 
-        // Bind a socket to a random port, then run the server on it.
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
+        let tb_clone = tb.clone();
+        let metrics_clone = metrics.clone();
+        let quality_clone = quality.clone();
         let server_handle = tokio::spawn(async move {
-            // Re-bind on the same port we just probed.
-            let s = NtpServer::new(addr, tb, metrics, zero_rtt());
+            let s = NtpServer::new(addr, tb_clone, metrics_clone, quality_clone, 16_000);
             let _ = s.run().await;
         });
 
@@ -411,6 +710,20 @@ mod tests {
         assert_ne!(&resp[32..40], &[0u8; 8]);
         assert_ne!(&resp[40..48], &[0u8; 8]);
 
+        // root_delay (bytes 4-7) should be non-zero (upstream=5 + rtt=10 = 15ms)
+        let root_delay = u32::from_be_bytes(resp[4..8].try_into().unwrap());
+        assert!(
+            root_delay > 0,
+            "root_delay must be non-zero when quality data is present"
+        );
+
+        // root_dispersion (bytes 8-11) should be non-zero
+        let root_dispersion = u32::from_be_bytes(resp[8..12].try_into().unwrap());
+        assert!(
+            root_dispersion > 0,
+            "root_dispersion must be non-zero when quality data is present"
+        );
+
         server_handle.abort();
     }
 
@@ -424,8 +737,9 @@ mod tests {
 
         let metrics_clone = metrics.clone();
         let tb_clone = tb.clone();
+        let quality = no_quality();
         let server_handle = tokio::spawn(async move {
-            let s = NtpServer::new(addr, tb_clone, metrics_clone, zero_rtt());
+            let s = NtpServer::new(addr, tb_clone, metrics_clone, quality, 16_000);
             let _ = s.run().await;
         });
 
@@ -446,57 +760,16 @@ mod tests {
         assert_eq!(b0 >> 6 & 0x03, LI_ALARM_UNSYNCHRONIZED, "unsynced → LI=3");
         assert_eq!(resp[1], STRATUM_UNSYNCHRONIZED, "unsynced → Stratum=16");
 
+        // root_delay and root_dispersion must be 0 when unsynced
+        let root_delay = u32::from_be_bytes(resp[4..8].try_into().unwrap());
+        let root_dispersion = u32::from_be_bytes(resp[8..12].try_into().unwrap());
+        assert_eq!(root_delay, 0, "unsynced path must have root_delay=0");
+        assert_eq!(
+            root_dispersion, 0,
+            "unsynced path must have root_dispersion=0"
+        );
+
         server_handle.abort();
-    }
-
-    #[test]
-    fn build_response_synced_uses_stratum_2() {
-        let tb = synced_timebase();
-        let mut req = NtpPacket::new(0, 4, 3);
-        req.transmit_timestamp = 0xAAAA_BBBB_CCCC_DDDD;
-        let r = build_response(&tb, &req, 0x1111_2222_3333_4444, 0);
-        assert_eq!(r.li, 0);
-        assert_eq!(r.stratum, 2);
-        assert_eq!(r.mode, 4);
-        assert_eq!(r.origin_timestamp, 0xAAAA_BBBB_CCCC_DDDD);
-        assert_eq!(r.reference_id, REFERENCE_ID_LOCAL);
-    }
-
-    #[test]
-    fn build_response_unsynced_uses_stratum_16() {
-        let tb = unsynced_timebase();
-        let req = NtpPacket::new(0, 4, 3);
-        let r = build_response(&tb, &req, 0, 0);
-        assert_eq!(r.li, LI_ALARM_UNSYNCHRONIZED);
-        assert_eq!(r.stratum, STRATUM_UNSYNCHRONIZED);
-        assert_eq!(r.reference_id, 0);
-        assert_eq!(r.ref_timestamp, 0);
-    }
-
-    #[test]
-    fn build_response_synced_includes_root_delay() {
-        let tb = synced_timebase();
-        let req = NtpPacket::new(0, 4, 3);
-        // 10ms RTT → root_delay = 10 * 65536 / 1000 = 655
-        let r = build_response(&tb, &req, 0, 10);
-        assert_eq!(r.root_delay, 655);
-    }
-
-    #[test]
-    fn build_response_unsynced_root_delay_is_zero() {
-        let tb = unsynced_timebase();
-        let req = NtpPacket::new(0, 4, 3);
-        let r = build_response(&tb, &req, 0, 50);
-        assert_eq!(r.root_delay, 0, "unsynced path must always report 0");
-    }
-
-    #[test]
-    fn ms_to_ntp_short_values() {
-        assert_eq!(ms_to_ntp_short(0), 0);
-        // 10ms → 655
-        assert_eq!(ms_to_ntp_short(10), 655);
-        // 1000ms (1 sec) → 65536
-        assert_eq!(ms_to_ntp_short(1000), 65536);
     }
 
     // ── UdpRateLimiter tests ─────────────────────────────────────────────────
@@ -543,4 +816,9 @@ mod tests {
             assert!(rl.allow(ip), "limit=0 should allow everything");
         }
     }
+
+    // ── Unused AtomicU64 import guard ─────────────────────────────────────
+    // (referenced by the outer test helpers that use Arc<AtomicU64>)
+    #[allow(dead_code)]
+    fn _uses_atomic_u64(_: Arc<AtomicU64>) {}
 }

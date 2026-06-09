@@ -1,0 +1,85 @@
+# Prometheus alerting rules for ntp-time-json-api (P1-8: replica drift visibility).
+#
+# Apply with: kubectl apply -f k8s/prometheus-rules.yaml
+#
+# Thresholds:
+#   NtpTimeReplicaHighUncertainty  — fires when uncertainty_ms > 250 for 5 min
+#   NtpTimeReplicaStopped         — fires when serve_state > 1 (stopped=2, unsynced=3) for 2 min
+#   NtpTimeReplicaSpreadHigh      — fires when max-min offset across replicas > 100 ms for 5 min
+#   NtpTimeSingleProvider         — fires when ntp_selection_single_provider == 1 for 10 min
+#
+# All thresholds are documented inline. Adjust `for:` and `expr:` to match your SLA.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ntp-time-api-alerts
+  labels:
+    app: ntp-time-api
+spec:
+  groups:
+  - name: ntp-time-api.replica
+    interval: 30s
+    rules:
+
+    # Fires when a replica's combined time uncertainty exceeds the readiness
+    # threshold (default 250 ms) for several minutes, indicating the replica
+    # is degraded and may stop serving accurate time.
+    - alert: NtpTimeReplicaHighUncertainty
+      expr: time_replica_uncertainty_milliseconds > 250
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "NTP replica {{ $labels.replica_id }} has high time uncertainty"
+        description: >
+          Replica {{ $labels.replica_id }} reports uncertainty {{ $value | humanize }}ms,
+          exceeding the 250ms threshold. The replica may soon stop serving /time (503).
+          Check NTP upstream connectivity and selection diagnostics via /status.
+
+    # Fires when a replica's serve_state is stopped (2) or unsynced (3),
+    # meaning it is returning 503 for /time requests.
+    - alert: NtpTimeReplicaStopped
+      expr: time_replica_serve_state > 1
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "NTP replica {{ $labels.replica_id }} is stopped or unsynced"
+        description: >
+          Replica {{ $labels.replica_id }} has serve_state={{ $value }}
+          (2=stopped, 3=unsynced). It is not serving time to clients.
+          Check /status for the full quality envelope and NTP upstream health.
+
+    # Computes the spread across all replicas' last-known NTP offsets.
+    # A large spread indicates replicas are reading from sources that disagree,
+    # which can cause clients to get inconsistent epoch values depending on
+    # which pod they hit.
+    # Note: this alert has no replica_id label — it fires on the entire cluster.
+    - alert: NtpTimeReplicaSpreadHigh
+      expr: >
+        max(time_replica_offset_milliseconds) - min(time_replica_offset_milliseconds) > 100
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "NTP replicas are drifting apart"
+        description: >
+          The spread across replicas' NTP offsets is {{ $value | humanize }}ms,
+          exceeding the 100ms threshold. Replicas may be selecting from different
+          or disagreeeing NTP sources. Inspect /status on each pod and review
+          NTP_SERVERS configuration.
+
+    # Fires when NTP server selection is dominated by a single provider group
+    # (e.g. all pool.ntp.org servers). This causes uncertainty to be doubled
+    # and indicates a lack of source diversity.
+    - alert: NtpTimeSingleProvider
+      expr: ntp_selection_single_provider == 1
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "NTP selection is using a single provider"
+        description: >
+          All NTP agreers belong to the same provider group. Time uncertainty
+          has been doubled as a precaution. Add diverse NTP sources from different
+          providers to NTP_SERVERS to resolve this alert.
