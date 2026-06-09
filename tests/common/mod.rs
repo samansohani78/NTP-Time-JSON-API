@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use ntp_time_json_api::{
     config::Config,
-    http::{create_router_for_test, state::AppState},
+    http::{create_router, create_router_for_test, state::AppState},
     metrics::{Metrics, ReplicaLabel},
     ntp::{
         NtpServer, NtpSyncer, SyncOutcome, SyncQuality,
@@ -254,6 +254,37 @@ async fn start_http_server(state: Arc<AppState>) -> TestServer {
     }
 }
 
+/// Like `start_http_server` but with rate limiting enabled and ConnectInfo injected,
+/// matching the production `main.rs` serve path exactly.
+async fn start_http_server_rate_limited(state: Arc<AppState>) -> TestServer {
+    let app = create_router(state.clone()); // rate limiting enabled (disable_rate_limiting=false)
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    TestServer {
+        base_url: format!("http://{addr}"),
+        http_addr: addr,
+        state,
+        _shutdown: shutdown_tx,
+    }
+}
+
 // ── Public spawn functions ────────────────────────────────────────────────────
 
 /// Spawn an HTTP server that has NOT yet performed any NTP sync.
@@ -285,6 +316,30 @@ pub async fn spawn_server_synced(upstream: &MockNtpUpstream) -> TestServer {
     apply_sync_to_state(&state, &outcome);
 
     start_http_server(state).await
+}
+
+/// Spawn an HTTP server with rate limiting enabled (production code path).
+/// Uses `into_make_service_with_connect_info` so `PeerIpKeyExtractor` can read
+/// the client IP — the same path as `main.rs`.
+pub async fn spawn_server_synced_rate_limited(upstream: &MockNtpUpstream) -> TestServer {
+    let mut config = Config::default();
+    config.ntp.servers = vec![upstream.addr.to_string()];
+    config.ntp.timeout_secs = 5;
+    config.ntp.require_sync = true;
+    config.ntp.selection.min_quorum = 1;
+    config.ws.update_interval_ms = 100;
+    // disable_rate_limiting defaults to false — rate limiting IS active
+    let config = Arc::new(config);
+
+    let state = build_state(config.clone());
+    let syncer = NtpSyncer::new(Arc::new(config.ntp.clone()));
+    let outcome = syncer
+        .sync()
+        .await
+        .expect("initial sync against mock NTP upstream should succeed");
+    apply_sync_to_state(&state, &outcome);
+
+    start_http_server_rate_limited(state).await
 }
 
 /// Spawn an HTTP server and a UDP NTP server component, both synced.

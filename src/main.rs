@@ -144,7 +144,12 @@ async fn main() -> anyhow::Result<()> {
         "HTTP server listening"
     );
 
-    let http_server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    // into_make_service_with_connect_info is required: tower_governor's PeerIpKeyExtractor reads ConnectInfo<SocketAddr>.
+    let http_server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal());
 
     // Run HTTP server and wait for shutdown
     if let Err(e) = http_server.await {

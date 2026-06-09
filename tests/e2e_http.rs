@@ -666,3 +666,73 @@ async fn time_body_has_no_intersection_field() {
         "/time body must not contain intersection field"
     );
 }
+
+// ── Rate-limiting regression (ConnectInfo) ────────────────────────────────────
+// These tests use the production serve path (into_make_service_with_connect_info)
+// to verify that PeerIpKeyExtractor can read the client IP and does NOT return
+// the "Unable To Extract Key!" 500 error that occurs when ConnectInfo is absent.
+
+/// /time must NOT 500 when rate limiting is enabled (ConnectInfo regression).
+#[tokio::test]
+async fn rate_limited_time_does_not_500() {
+    let upstream = common::start_mock_ntp_upstream(1_704_067_200_000).await;
+    let server = common::spawn_server_synced_rate_limited(&upstream).await;
+
+    let resp = client()
+        .await
+        .get(format!("{}/time", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    assert_ne!(
+        status, 500,
+        "/time must not return 500 with rate limiting enabled"
+    );
+    assert!(
+        status == 200 || status == 503,
+        "/time must return 200 or 503, got {status}"
+    );
+}
+
+/// /time/full must NOT 500 when rate limiting is enabled (ConnectInfo regression).
+#[tokio::test]
+async fn rate_limited_time_full_does_not_500() {
+    let upstream = common::start_mock_ntp_upstream(1_704_067_200_000).await;
+    let server = common::spawn_server_synced_rate_limited(&upstream).await;
+
+    let resp = client()
+        .await
+        .get(format!("{}/time/full", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    assert_ne!(
+        status, 500,
+        "/time/full must not return 500 with rate limiting enabled"
+    );
+    assert!(
+        status == 200 || status == 503,
+        "/time/full must return 200 or 503, got {status}"
+    );
+}
+
+/// /status must NOT 500 when rate limiting is enabled (ConnectInfo regression).
+#[tokio::test]
+async fn rate_limited_status_does_not_500() {
+    let upstream = common::start_mock_ntp_upstream(1_704_067_200_000).await;
+    let server = common::spawn_server_synced_rate_limited(&upstream).await;
+
+    let resp = client()
+        .await
+        .get(format!("{}/status", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/status must always return 200 with rate limiting enabled"
+    );
+}
