@@ -30,7 +30,7 @@ services:
       # Tier 1: Major providers (Google, Cloudflare, Facebook)
       # Tier 2: Pool servers (global, ubuntu, asia)
       # Total: 24 servers for best consensus and redundancy
-      - NTP_SERVERS=time.google.com:123,time1.google.com:123,time2.google.com:123,time3.google.com:123,time4.google.com:123,time.cloudflare.com:123,time.facebook.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123,ntp.ubuntu.com:123,0.ubuntu.pool.ntp.org:123,1.ubuntu.pool.ntp.org:123,2.ubuntu.pool.ntp.org:123,0.asia.pool.ntp.org:123,1.asia.pool.ntp.org:123,2.asia.pool.ntp.org:123,3.asia.pool.ntp.org:123,time.nist.gov:123,time-a-g.nist.gov:123,time-b-g.nist.gov:123,time-c-g.nist.gov:123
+      - NTP_SERVERS=ntp.time.ir,time.google.com:123,time1.google.com:123,time2.google.com:123,time3.google.com:123,time4.google.com:123,time.cloudflare.com:123,time.facebook.com:123,pool.ntp.org:123,0.pool.ntp.org:123,1.pool.ntp.org:123,2.pool.ntp.org:123,3.pool.ntp.org:123,ntp.ubuntu.com:123,0.ubuntu.pool.ntp.org:123,1.ubuntu.pool.ntp.org:123,2.ubuntu.pool.ntp.org:123,0.asia.pool.ntp.org:123,1.asia.pool.ntp.org:123,2.asia.pool.ntp.org:123,3.asia.pool.ntp.org:123,time.nist.gov:123,time-a-g.nist.gov:123,time-b-g.nist.gov:123,time-c-g.nist.gov:123
       - NTP_TIMEOUT=2
       - NTP_SERVER_ENABLED=true
       - NTP_SERVER_ADDR=0.0.0.0:123
