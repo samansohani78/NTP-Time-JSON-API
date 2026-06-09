@@ -1,7 +1,3 @@
-// Items here are part of the planned P0-2 wiring; suppress dead_code
-// warnings until then (same pattern as protocol.rs).
-#![allow(dead_code)]
-
 //! Packet-level async NTP client (P0-1).
 //!
 //! Captures real T1/T4 timestamps and parses measured T2/T3, root_delay,

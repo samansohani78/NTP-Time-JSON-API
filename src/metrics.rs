@@ -67,9 +67,9 @@ pub struct Metrics {
     // Time-quality envelope metrics (P0-4)
     /// Computed time uncertainty (ms) from the most recent sync quality snapshot.
     pub time_uncertainty_milliseconds: Gauge<f64, AtomicU64>,
-    /// Encoded time source mode: 0=ntp, 1=degraded, 2=unsynced, 3=manual.
+    /// Encoded time source mode: 0=ntp, 1=degraded, 2=unsynced, 3=manual, 4=holdover.
     pub time_source_mode: Gauge,
-    /// Encoded serve state: 0=ok, 1=degraded, 2=stopped, 3=unsynced.
+    /// Encoded serve state: 0=ok, 1=degraded, 2=stopped, 3=unsynced, 4=holdover.
     pub time_serve_state: Gauge,
 
     // P1-6 selection metrics
@@ -103,9 +103,9 @@ pub struct Metrics {
     pub time_replica_offset_milliseconds: Family<ReplicaLabel, Gauge<f64, AtomicU64>>,
     /// Current combined time uncertainty of this replica (ms).
     pub time_replica_uncertainty_milliseconds: Family<ReplicaLabel, Gauge<f64, AtomicU64>>,
-    /// Serve state of this replica: 0=ok, 1=degraded, 2=stopped, 3=unsynced.
+    /// Serve state of this replica: 0=ok, 1=degraded, 2=stopped, 3=unsynced, 4=holdover.
     pub time_replica_serve_state: Family<ReplicaLabel, Gauge>,
-    /// Time source mode of this replica: 0=ntp, 1=degraded, 2=unsynced, 3=manual.
+    /// Time source mode of this replica: 0=ntp, 1=degraded, 2=unsynced, 3=manual, 4=holdover.
     pub time_replica_source_mode: Family<ReplicaLabel, Gauge>,
 
     // Manual override metrics (P1-7)
@@ -347,14 +347,14 @@ impl Metrics {
         let time_source_mode = Gauge::default();
         registry.register(
             "time_source_mode",
-            "Time source mode: 0=ntp, 1=degraded, 2=unsynced",
+            "Time source mode: 0=ntp, 1=degraded, 2=unsynced, 3=manual, 4=holdover",
             time_source_mode.clone(),
         );
 
         let time_serve_state = Gauge::default();
         registry.register(
             "time_serve_state",
-            "Serve state: 0=ok, 1=degraded, 2=stopped, 3=unsynced",
+            "Serve state: 0=ok, 1=degraded, 2=stopped, 3=unsynced, 4=holdover",
             time_serve_state.clone(),
         );
 
@@ -378,14 +378,14 @@ impl Metrics {
         let time_replica_serve_state = Family::<ReplicaLabel, Gauge>::default();
         registry.register(
             "time_replica_serve_state",
-            "Serve state of this replica: 0=ok, 1=degraded, 2=stopped, 3=unsynced",
+            "Serve state of this replica: 0=ok, 1=degraded, 2=stopped, 3=unsynced, 4=holdover",
             time_replica_serve_state.clone(),
         );
 
         let time_replica_source_mode = Family::<ReplicaLabel, Gauge>::default();
         registry.register(
             "time_replica_source_mode",
-            "Time source mode of this replica: 0=ntp, 1=degraded, 2=unsynced, 3=manual",
+            "Time source mode of this replica: 0=ntp, 1=degraded, 2=unsynced, 3=manual, 4=holdover",
             time_replica_source_mode.clone(),
         );
 
