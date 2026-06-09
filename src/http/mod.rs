@@ -260,7 +260,7 @@ mod tests {
     }
 
     /// Full pipeline: mock NTP server → sync → /time returns 200 with the
-    /// correct epoch. Uses a real UDP socket to exercise the rsntp path.
+    /// correct epoch. Uses a real UDP socket and the in-house PacketNtpClient.
     #[tokio::test]
     async fn test_time_after_sync_returns_correct_epoch() {
         use crate::ntp::sync::NtpSyncer;

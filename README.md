@@ -16,8 +16,10 @@ the P0 tasks in [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md).
 >   and the serve/stop policy (503 when uncertainty exceeds
 >   `SERVE_OK_MAX_UNCERTAINTY_MS`/`SERVE_DEGRADED_MAX_UNCERTAINTY_MS`) are all live.
 >   `/readyz` gates on `READINESS_MAX_UNCERTAINTY_MS` (250 ms default) after first sync.
-> - There is **no secure manual time-override** path yet — P1-7.
-> - ~~There is no full end-to-end CI~~ — **fixed (P0-5)**: real E2E harness (`tests/e2e_*.rs`)
+> - ~~There is no secure manual time-override path~~ — **done (P1-7)**: `/admin/time/override`
+>   (POST/GET/DELETE) is live; requires `ADMIN_API_ENABLED=true` and `ADMIN_API_TOKEN`;
+>   bearer-token auth with constant-time comparison; force, TTL, and jump-limit guards.
+> - ~~There is no full end-to-end CI~~ — **done (P0-5)**: real E2E harness (`tests/e2e_*.rs`)
 >   exercises HTTP, UDP NTP, WebSocket, and metrics endpoints against an in-process server using a
 >   mock NTP upstream; CI `e2e` job runs on every push. Use `make e2e` locally.
 >
@@ -69,9 +71,10 @@ This ensures:
 - **Sync Interval**: Background sync every 30 seconds (configurable)
 - **Probe Loop**: Separate jittered loop for keeping server stats fresh
 
-> Planned: P1-6 in [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md) replaces this with an
-> uncertainty-scored selection model (per-sample root distance + quorum), and P1F-12 adds
-> interval-intersection robustness against an independently-wrong majority.
+> **Done (P1-6 + P1F-12):** The weighted-median selector (`WeightedMedianSelector`) with per-sample
+> root-distance λ scoring, quorum gate, and provider-group cap is live. Marzullo
+> interval-intersection pre-filter (P1F-12) runs before the weighted-median step: falsetickers are
+> discarded and competing clusters fail closed. See `src/ntp/selection.rs`.
 
 ### Probe Behavior
 
@@ -157,6 +160,20 @@ determine whether `/time` would return 200 or 503.
   "ntp_synced": true
 }
 ```
+
+### Admin API (P1-7, requires `ADMIN_API_ENABLED=true`)
+
+All admin routes return 404 when disabled. Auth: `Authorization: Bearer <ADMIN_API_TOKEN>`. Missing or wrong token returns 401 with identical bodies (no oracle).
+
+**`POST /admin/time/override`** — Set a manual time override.
+```json
+{ "epoch_ms": 1704067200000, "ttl_seconds": 60, "reason": "operator note", "force": false }
+```
+Returns 200 on success. `force: true` bypasses the jump limit (`MANUAL_OVERRIDE_MAX_JUMP_MS`) and requires `MANUAL_OVERRIDE_ALLOW_FORCE=true`.
+
+**`GET /admin/time/override`** — Get the current override status (active or not).
+
+**`DELETE /admin/time/override`** — Cancel the active override and revert to NTP time.
 
 ### `GET /healthz`
 
@@ -272,6 +289,39 @@ All configuration via environment variables:
 |----------|---------|-------------|
 | `NTP_INTERVAL_SELECTION_ENABLED` | `true` | Enable Marzullo/interval-intersection pre-filter before the weighted-median step. When true, candidates whose uncertainty intervals don't overlap the consensus region (falsetickers) are discarded; ambiguous competing clusters cause fail-closed. Set to `false` to disable (not recommended in production). |
 
+### Advanced Selection Configuration (P1-6)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MIN_QUORUM` | `2` | Minimum agreeing servers required for a valid sync |
+| `MAX_STRATUM` | `4` | Hard-reject servers at or above this stratum |
+| `MAX_ROOT_DISTANCE_MS` | `500` | Hard-reject servers whose λ (root distance) exceeds this value (ms) |
+| `MAX_SAMPLE_AGE_SECS` | `60` | Hard-reject samples older than this (seconds) |
+| `REJECT_LEAP_ALARM` | `true` | Hard-reject servers with leap indicator = 3 (clock unsynchronized) |
+| `NTP_PROVIDER_GROUPS` | `` | Override provider-group assignment; format: `server1=group1,server2=group2` |
+| `PROVIDER_GROUP_MAX_FRACTION` | `0.5` | Fraction threshold above which a single provider group triggers uncertainty doubling |
+| `MAX_CONSECUTIVE_FAILURES` | `10` | Number of consecutive sync failures before `/readyz` reports unhealthy |
+
+### Admin / Manual Override Configuration (P1-7)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ADMIN_API_ENABLED` | `false` | Enable the admin API (`/admin/*`). When false, admin routes are not registered (Axum returns 404). |
+| `ADMIN_API_TOKEN` | *(required if enabled)* | Bearer token for admin endpoint authentication. Startup fails if enabled but token is empty. |
+| `MANUAL_OVERRIDE_MAX_TTL_SECS` | `300` | Maximum TTL for a manual time override (seconds) |
+| `MANUAL_OVERRIDE_MAX_JUMP_MS` | `5000` | Maximum allowed clock jump for override without `force=true` (ms) |
+| `MANUAL_OVERRIDE_ALLOW_FORCE` | `false` | Allow `force=true` in override requests (bypasses jump limit) |
+| `MANUAL_OVERRIDE_DISPERSION_MS` | `1000` | Uncertainty advertised while a manual override is active (ms) |
+
+### UDP NTP Server Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NTP_SERVER_ENABLED` | `false` | Enable the optional Stratum-2 UDP NTP server. Requires `CAP_NET_BIND_SERVICE` in Kubernetes when binding to port 123. |
+| `NTP_SERVER_ADDR` | `0.0.0.0:123` | UDP NTP server bind address |
+| `NTP_SERVER_MAX_ROOT_DISPERSION_MS` | `16000` | Maximum root_dispersion the UDP server will advertise (ms) |
+| `NTP_SERVER_MAX_PACKET_SIZE` | `1024` | Maximum inbound UDP packet size accepted (bytes; minimum 48) |
+
 ### Logging Configuration
 
 | Variable | Default | Description |
@@ -314,8 +364,8 @@ cargo build --release
 ### Run Tests
 
 ```bash
-cargo test        # all tests: unit + inline integration + E2E (132 tests)
-make e2e          # E2E tests only: HTTP, UDP NTP, WebSocket, metrics (22 tests)
+cargo test        # all tests: unit + E2E (213 tests)
+make e2e          # E2E tests only: HTTP, UDP NTP, WebSocket, metrics (39 tests)
 make ci           # fmt-check + clippy + all tests (same as CI)
 ```
 
@@ -421,6 +471,22 @@ distinguish them from the upstream-source metrics above (renamed from the former
 - `ntp_udp_server_errors_total` - UDP NTP errors (malformed packets, send failures, rate-limited drops)
 - `ntp_udp_server_unsynced_responses_total` - Responses sent while unsynced (LI=3, Stratum=16)
 
+### Selection / Uncertainty Metrics (P1-6)
+
+- `ntp_selection_quorum_size` — count of servers agreeing with the weighted-median consensus
+- `ntp_selection_falsetickers_total` — cumulative count of candidates hard-rejected by gates
+- `ntp_selection_rejected_total{reason}` — per-reason rejection counter (stratum, leap, age, distance, jitter)
+- `ntp_sample_uncertainty_milliseconds{server}` — per-upstream λ (root distance) at last sync
+- `ntp_combined_uncertainty_milliseconds` — selected server's combined uncertainty after provider-cap inflation
+- `ntp_selection_single_provider` — 1 when one provider group holds > 50% of agreers (uncertainty doubled)
+
+### Manual Override Metrics (P1-7)
+
+- `manual_override_active` — 1 when a manual override is active, 0 otherwise
+- `manual_override_total` — cumulative count of overrides set since process start
+- `manual_override_expiry_timestamp_seconds` — Unix timestamp when the current override expires; 0 if none
+- `manual_override_rejected_total{reason}` — rejected override requests by reason (e.g., `jump_too_large`, `force_not_allowed`)
+
 ### Time-Quality Envelope Metrics (P0-4)
 
 - `time_uncertainty_milliseconds` - Computed time uncertainty (ms) from most recent NTP sync (RFC 5905 §11.2)
@@ -501,8 +567,13 @@ After each NTP sync, the following metrics reflect the Marzullo sweep result:
 │       ├── protocol.rs      # RFC 5905 NTP packet codec (encode/decode)
 │       └── server.rs        # Optional UDP NTP server (Stratum 2)
 ├── tests/
-│   └── integration_api.rs   # Placeholder (real tests are inline in src/http/mod.rs;
-│                            #  full E2E harness is planned as P0-5)
+│   ├── integration_api.rs   # Redirect comment → real E2E harness in e2e_*.rs (P0-5 done)
+│   ├── e2e_http.rs          # HTTP endpoint E2E tests
+│   ├── e2e_metrics.rs       # Prometheus metrics E2E tests
+│   ├── e2e_ntp_udp.rs       # UDP NTP server E2E tests
+│   ├── e2e_websocket.rs     # WebSocket E2E tests
+│   ├── e2e_manual_override.rs # Admin manual-override E2E tests (P1-7)
+│   └── common/mod.rs        # Shared E2E helpers (mock NTP upstream, spawn helpers)
 ├── k8s/                     # Kubernetes manifests
 ├── Dockerfile               # Multi-stage build → distroless nonroot
 └── Cargo.toml               # Dependencies

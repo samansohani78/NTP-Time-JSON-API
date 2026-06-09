@@ -16,11 +16,14 @@ Two distinct readiness states — do **not** conflate them:
   `PRODUCTION_ACCURACY_PLAN.md`) is active and unstarted. **The service is not production-ready for
   financial/time-critical use today.**
 
-> **Why not financial-ready yet.** P0-1 through P0-5 are complete: rsntp is removed; T2/T3 and
+> **Why not financial-ready yet.** All P0 and P1 tasks are complete: rsntp is removed; T2/T3 and
 > root fields are measured from packet bytes; the UDP server advertises honest `root_delay` and
 > `root_dispersion`; time-quality envelope, `/status`, `/time/full`, serve/stop SLA, and quality
 > response headers are all live; a real E2E harness (`tests/e2e_*.rs`) and CI `e2e` job are in
-> place. P1-7 secure manual-override API is also complete (see below).
+> place; P1-6 weighted-median + quorum selection and P1F-12 Marzullo intersection are live; P1-7
+> secure manual-override API is complete; P1-8 replica-drift metrics and Prometheus alerts are live.
+> Financial/time-critical use requires NTS (authenticated upstream NTP), host-clock discipline
+> (chrony/ntpd integration), and a formal SLA sign-off — none of which are in scope here.
 > See **`PRODUCTION_ACCURACY_PLAN.md`** (P0/P1/P2, phased) for the plan.
 
 ---
@@ -42,7 +45,7 @@ Full implementation-ready detail (structs, functions, tests, acceptance criteria
 | **P1-8** Replica-drift visibility (no consensus) | P1 | **done** | `src/http/handlers.rs`, `src/config.rs`, `src/metrics.rs`, `k8s/prometheus-rules.yaml`*(new)*, `k8s/deployment.yaml`, `PROJECT_ARCHITECTURE.md` | `REPLICA_ID` config; `/status` + `/time/full` include `replica_id`, `selected_offset_ms`, `combined_uncertainty_ms`, `selected_provider`, `selection_state`; 4 replica Family metrics; 4 Prometheus alert rules; downward API in deployment; 8 new tests | `cargo test replica` + `make e2e` |
 | **P1F-12** Marzullo / interval-intersection robustness follow-up to P1-6 | P1-followup | **done** | `src/ntp/selection.rs`, `src/config.rs`, `src/metrics.rs`, `src/main.rs`, `src/http/handlers.rs`, `tests/common/mod.rs` | Marzullo sweep pre-filter before weighted-median: truechimers/falsetickers, fail-closed on NoIntersection/AmbiguousCluster; `NTP_INTERVAL_SELECTION_ENABLED` config (default true); `IntersectionDiagnostics` in `/status` + `/time/full`; 5 new Prometheus metrics; 10 unit tests; 5 E2E tests | `cargo test ntp::selection && make e2e` |
 | **P2-9** Cleanup: drop `rsntp`, retire tautological test, document/expose bias knobs, rename `SelectionStrategy` | P2 | todo | `Cargo.toml`, `src/ntp/selection.rs`, `src/config.rs`, `src/http/handlers.rs` | `rsntp` removed; `rfc5905_four_tuple_relations_hold` replaced by real wire-parse test; bias knobs surfaced in `/status` | `cargo build && cargo test` |
-| **DOC-1** Reconcile public docs (`README.md`, `CLAUDE.md`) with reality + this roadmap — **do before OPS-1 commit** | P1 | todo | `README.md`, `CLAUDE.md` | No public doc claims unqualified "production-ready", "RTT-min", or rsntp-as-fine; see checklist in `PRODUCTION_ACCURACY_PLAN.md` §7.1 | `grep -nE "production-ready\|RTT-min\|SAMPLE_SERVERS_PER_SYNC\|UID 1000" README.md CLAUDE.md` → only intended hits |
+| **DOC-1** Reconcile public docs (`README.md`, `CLAUDE.md`) with reality + this roadmap | P1 | **done** | `README.md`, `CLAUDE.md`, `PROJECT_ARCHITECTURE.md`, `PROJECT_PLAN.md` | No public doc claims unqualified "production-ready", "RTT-min", or rsntp-as-fine; admin API, selection metrics, NTP server config, remaining limitations all documented; test counts correct; P1-7/P1-6/P1F-12 marked done | `grep -nE "production-ready\|RTT-min\|SAMPLE_SERVERS_PER_SYNC\|UID 1000" README.md CLAUDE.md` → only intended hits |
 | **OPS-1** Track plan/docs in `.gitignore` | P2 | todo | `.gitignore` | `git check-ignore PROJECT_PLAN.md` empty; 3 plan docs + `CLAUDE.md` addable | `git check-ignore -v PROJECT_PLAN.md` |
 | **OPS-2** Fix misleading `fcd8895` commit message | P2 | todo *(needs approval — pushed)* | git history | history attributes the change correctly; **no force-push without approval** (commit is pushed) | `git log --oneline -3` |
 
