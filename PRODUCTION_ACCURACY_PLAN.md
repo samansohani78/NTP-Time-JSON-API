@@ -131,7 +131,7 @@ pub fn precision_log2_to_ms(p: i8) -> f64 { 2f64.powi(p as i32) * 1000.0 }
 - `src/timebase.rs` — `SyncResult` gains the carry-through fields (no read-path change).
 
 **Structs to change**
-```rust
+```text
 // NtpResult / SyncResult / NtpTimingSummary all gain:
 root_delay_ms: u32, root_dispersion_ms: u32, stratum: u8, leap: u8,
 precision_log2: i8, reference_id: u32,
@@ -504,7 +504,7 @@ admin_router = /admin/* routes + require_admin_auth layer
 ##### 6. Source Behavior While Active
 
 **TimeBase additions (4 new atomics):**
-```rust
+```text
 manual_active: Arc<AtomicBool>,
 manual_base_epoch_ms: Arc<AtomicI64>,
 manual_base_instant_nanos: Arc<AtomicU64>,  // nanos since REFERENCE_INSTANT at set time
@@ -524,7 +524,7 @@ NTP path (existing): has_synced → base_epoch_ms + elapsed; else None
 ```
 
 **`TimeQuality` extension** — add to the existing struct:
-```rust
+```text
 pub override_info: Option<OverrideInfo>,
 ```
 ```rust
@@ -575,7 +575,7 @@ The `NtpServer::handle_request` / `build_response` receives `Option<&SyncQuality
 2. **`now_ms()` lazy check (safety backstop):** If `manual_active=true` and current time ≥ `expires_at_nanos`, store `false` to `manual_active`. No audit log from here (to keep the hot path clean). The background task will still fire and emit the audit log (the `manual_active.store(false)` from `now_ms()` is idempotent with the background task's clear).
 
 **`AppState` additions:**
-```rust
+```text
 pub override_state: Arc<parking_lot::RwLock<Option<ManualOverrideState>>>,
 pub override_task: Arc<parking_lot::Mutex<Option<tokio::task::AbortHandle>>>,
 ```

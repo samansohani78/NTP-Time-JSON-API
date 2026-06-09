@@ -12,12 +12,9 @@ axum = { version = "0.8.9", features = ["macros", "ws"] }
 tower = "0.5.3"
 tower-http = { version = "0.6.11", features = ["trace", "timeout", "limit", "request-id", "util", "cors"] }
 tower_governor = "0.8.0"
-hyper = { version = "1.10.1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 # Async runtime
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
-tokio-stream = "0.1.18"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -54,7 +51,6 @@ subtle = "2"
 
 [dev-dependencies]
 reqwest = { version = "0.13.4", features = ["json"] }
-tokio-test = "0.4.5"
 tokio-tungstenite = "0.26.2"
 futures-util = "0.3.32"
 

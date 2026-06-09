@@ -475,9 +475,15 @@ kubectl delete deployment ntp-time-api-v1
 ## Best Practices
 
 ### 1. Always Use Version Tags
+
+Do:
 ```yaml
-image: ntp-time-api:v1.0.0  # ✅ Good
-image: ntp-time-api:latest  # ❌ Bad
+image: ntp-time-api:v1.0.0
+```
+
+Avoid:
+```yaml
+image: ntp-time-api:latest
 ```
 
 ### 2. Set Resource Limits

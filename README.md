@@ -36,7 +36,7 @@ with Rust 1.92.
 
 The service uses a monotonic time progression model to avoid OS wall clock authority:
 
-```rust
+```text
 on successful NTP sync:
     base_ntp_epoch_ms = NTP epoch time in milliseconds
     base_instant = Instant::now() (monotonic clock)

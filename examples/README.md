@@ -231,7 +231,7 @@ const results = await Promise.all(promises);
 ```
 
 **Rust**:
-```rust
+```text
 // Sequential benchmark
 for _ in 0..100 {
     client.get_time_ms().await?;
