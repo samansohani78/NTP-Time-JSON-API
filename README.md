@@ -1,13 +1,27 @@
 # NTP Time JSON API
 
-A production-ready HTTP service that returns NTP-derived time as JSON, built with Rust 1.92.
+A **production-oriented, general-purpose** HTTP service that returns NTP-derived time as JSON, built
+with Rust 1.92. It is **not yet financial/time-critical production-ready** — that requires completing
+the P0 tasks in [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md).
+
+> **Current limitations (see [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md)):**
+> - Upstream T2/T3 are **reconstructed (estimated)** from offset/delay, not measured server
+>   timestamps (the `rsntp` client discards the raw timestamps).
+> - The UDP NTP server currently advertises **`root_dispersion = 0`** (false certainty).
+> - There is **no time-quality / uncertainty envelope** and no serve/stop SLA yet.
+> - There is **no secure manual time-override** path yet.
+> - There is **no full end-to-end CI** yet (unit + inline integration tests only).
+>
+> For financial / latency-sensitive deployments, follow the P0/P1 roadmap in
+> [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md) before relying on this service as an
+> authoritative time source.
 
 ## Features
 
 - **NTP-Authoritative Time**: Directly queries NTP servers (UDP) without relying on OS wall clock
 - **High Performance**: Lightweight hot-path with cached NTP time, sub-millisecond response times
 - **Monotonic Time Model**: Guarantees time never goes backwards using `Instant::now()` + NTP base
-- **Multi-Server Support**: Queries multiple NTP servers with RTT-based selection and automatic failover
+- **Multi-Server Support**: Queries all configured NTP servers each sync with accuracy-first selection and automatic failover
 - **Outlier Filtering**: Uses median offset calculation to reject divergent server responses
 - **Resilient**: Continues serving from cache if NTP sync fails after initial successful sync
 - **Kubernetes-Ready**: Includes liveness, readiness, and startup probes
@@ -37,12 +51,18 @@ This ensures:
 
 ### NTP Strategy
 
-- **Selection**: RTT-min strategy (chooses server with lowest round-trip time)
-- **Sampling**: Queries multiple servers per sync (default: 3)
+- **Selection**: accuracy-first / median-consensus based — picks the server whose offset is closest
+  to the consensus (median) offset; **RTT is only a tiebreaker**. (The `SELECTION_STRATEGY=rtt_min`
+  env value is a backwards-compatible alias for this algorithm, not "lowest RTT".)
+- **Sampling**: Queries **all** configured servers each sync (in parallel), then selects.
 - **Outlier Filtering**: Rejects servers beyond `MAX_OFFSET_SKEW_MS` from median
 - **Failover**: Automatically tries backup servers if primary fails
 - **Sync Interval**: Background sync every 30 seconds (configurable)
 - **Probe Loop**: Separate jittered loop for keeping server stats fresh
+
+> Planned: P1-6 in [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md) replaces this with an
+> uncertainty-scored selection model (per-sample root distance + quorum), and P1F-12 adds
+> interval-intersection robustness against an independently-wrong majority.
 
 ### Probe Behavior
 
@@ -165,8 +185,7 @@ All configuration via environment variables:
 | `PROBE_MAX_INTERVAL` | `20` | Max probe interval in seconds |
 | `MAX_STALENESS` | `120` | Max staleness before warning (seconds) |
 | `REQUIRE_SYNC` | `true` | Require successful NTP sync before serving |
-| `SELECTION_STRATEGY` | `rtt_min` | Server selection strategy |
-| `SAMPLE_SERVERS_PER_SYNC` | `3` | Number of servers to query per sync |
+| `SELECTION_STRATEGY` | `rtt_min` | Selection algorithm. `rtt_min` is a **backwards-compatible alias** for the accuracy-first / median-consensus algorithm (RTT is only a tiebreaker); `accuracy_first` is also accepted |
 | `MAX_OFFSET_SKEW_MS` | `1000` | Outlier threshold in milliseconds |
 | `MONOTONIC_OUTPUT` | `true` | Enable monotonic time clamping |
 | `OFFSET_BIAS_MS` | `0` | Manual time offset bias |
@@ -305,9 +324,19 @@ The service exposes Prometheus metrics at `/metrics`:
 - `ntp_staleness_seconds` - Seconds since last successful sync
 - `ntp_offset_seconds` - Current NTP time offset
 - `ntp_rtt_seconds` - NTP round-trip time histogram
-- `ntp_server_up{server}` - Server health status (1=up, 0=down)
-- `ntp_server_rtt_milliseconds{server}` - Per-server RTT
+- `ntp_server_up{server}` - Upstream NTP source health status (1=up, 0=down)
+- `ntp_server_rtt_milliseconds{server}` - Per-upstream-source RTT
 - `ntp_consecutive_failures` - Consecutive sync failure count
+
+### UDP NTP Server Metrics (when `NTP_SERVER_ENABLED=true`)
+
+These describe the local UDP NTP server (inbound), and are prefixed `ntp_udp_server_*` to
+distinguish them from the upstream-source metrics above (renamed from the former `ntp_server_*`):
+
+- `ntp_udp_server_requests_total` - UDP NTP requests received
+- `ntp_udp_server_responses_total` - UDP NTP responses sent
+- `ntp_udp_server_errors_total` - UDP NTP errors (malformed packets, send failures, rate-limited drops)
+- `ntp_udp_server_unsynced_responses_total` - Responses sent while unsynced (LI=3, Stratum=16)
 
 ### Build Info
 
@@ -322,7 +351,7 @@ The service exposes Prometheus metrics at `/metrics`:
 
 ## Security
 
-- Runs as non-root user (UID 1000)
+- Runs as non-root user (distroless `nonroot`, UID 65532; no shell in image)
 - Read-only root filesystem
 - All capabilities dropped
 - Request timeouts enforced
@@ -338,22 +367,27 @@ The service exposes Prometheus metrics at `/metrics`:
 │   ├── main.rs              # Entry point, background loops
 │   ├── config.rs            # Configuration management
 │   ├── errors.rs            # Error types
-│   ├── timebase.rs          # Monotonic time model
+│   ├── timebase.rs          # Lock-free monotonic time model
+│   ├── performance.rs       # TimeCache (zero-copy JSON) + LockFreeMetrics
 │   ├── metrics.rs           # Prometheus metrics
 │   ├── http/
-│   │   ├── mod.rs           # HTTP router
+│   │   ├── mod.rs           # HTTP router (fast/slow split, CORS, rate limit)
 │   │   ├── handlers.rs      # Endpoint handlers
-│   │   ├── middleware.rs    # HTTP middleware
+│   │   ├── middleware.rs    # HTTP middleware (metrics tracking)
+│   │   ├── websocket.rs     # WebSocket streaming (/stream)
 │   │   └── state.rs         # Application state
 │   └── ntp/
-│       ├── mod.rs           # NTP module
-│       ├── sync.rs          # NTP sync logic
-│       ├── selection.rs     # Server selection
-│       └── stats.rs         # Per-server statistics
+│       ├── mod.rs           # NTP module re-exports
+│       ├── sync.rs          # NTP sync logic (parallel query + sticky selection)
+│       ├── selection.rs     # Server selection (accuracy-first)
+│       ├── stats.rs         # Per-server statistics
+│       ├── protocol.rs      # RFC 5905 NTP packet codec (encode/decode)
+│       └── server.rs        # Optional UDP NTP server (Stratum 2)
 ├── tests/
-│   └── integration_api.rs   # Integration tests
+│   └── integration_api.rs   # Placeholder (real tests are inline in src/http/mod.rs;
+│                            #  full E2E harness is planned as P0-5)
 ├── k8s/                     # Kubernetes manifests
-├── Dockerfile               # Multi-stage Docker build
+├── Dockerfile               # Multi-stage build → distroless nonroot
 └── Cargo.toml               # Dependencies
 ```
 

@@ -31,11 +31,16 @@ debug/
 
 # MD Files
 CHANGELOG.md
-CLAUDE.md
 PROJECT_SUMMARY.md
 REQUIREMENTS_CHECKLIST.md
 IDEAS.md
 *.md
+
+# ...but keep these planning + guidance docs tracked despite the blanket *.md ignore
+!PROJECT_ARCHITECTURE.md
+!PROJECT_PLAN.md
+!PRODUCTION_ACCURACY_PLAN.md
+!CLAUDE.md
 
 # Docker
 docker-compose.override.yml
