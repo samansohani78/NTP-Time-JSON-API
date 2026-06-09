@@ -12,9 +12,7 @@ Two distinct readiness states — do **not** conflate them:
   needs registry credentials). All correctness bugs, test-coverage gaps, and previously-blocked
   maintenance items tracked in *this* file are resolved. The service is sound as a general-purpose
   time API.
-- **Financial / time-critical production hardening: NOT COMPLETE.** The P0/P1 roadmap below (and in
-  `PRODUCTION_ACCURACY_PLAN.md`) is active and unstarted. **The service is not production-ready for
-  financial/time-critical use today.**
+- **Financial / time-critical production hardening: P0/P1/P1F COMPLETE; P2 cleanup + external items remain.** The P0/P1/P1F roadmap in `PRODUCTION_ACCURACY_PLAN.md` is complete. Remaining work is P2-level cleanup (rsntp naming, bias-knob exposure) and external financial-grade requirements (NTS, host-clock discipline, formal SLA/security sign-off) that are out of scope for this project. **The service is sound as a general-purpose time API; not financial/time-critical production-ready without those external items.**
 
 > **Why not financial-ready yet.** All P0 and P1 tasks are complete: rsntp is removed; T2/T3 and
 > root fields are measured from packet bytes; the UDP server advertises honest `root_delay` and
@@ -44,18 +42,14 @@ Full implementation-ready detail (structs, functions, tests, acceptance criteria
 | **P1-7** Secure manual time-override API **(core requirement — P0/P1 boundary, "P1-high")** | P1-high | **done** *(merge requires security review)* | `src/timebase.rs`, `src/http/handlers_admin.rs`*(new)*, `src/http/mod.rs`, `src/http/middleware.rs`, `src/http/state.rs`, `src/ntp/server.rs`, `src/config.rs`, `src/metrics.rs`, `Cargo.toml` (+`subtle`) | 27 E2E tests green; disabled→404; bearer token with `subtle::ConstantTimeEq`; `MANUAL_OVERRIDE_MAX_TTL_SECS=300`, `MANUAL_OVERRIDE_MAX_JUMP_MS=5000`, `MANUAL_OVERRIDE_ALLOW_FORCE=false`; `source:"manual"` in HTTP+WS; UDP `MANU` refid; monotonic preserved across every transition; audit log at `warn` (no token); force bypass gated by `MANUAL_OVERRIDE_ALLOW_FORCE` | `cargo test --test e2e_manual_override` |
 | **P1-8** Replica-drift visibility (no consensus) | P1 | **done** | `src/http/handlers.rs`, `src/config.rs`, `src/metrics.rs`, `k8s/prometheus-rules.yaml`*(new)*, `k8s/deployment.yaml`, `PROJECT_ARCHITECTURE.md` | `REPLICA_ID` config; `/status` + `/time/full` include `replica_id`, `selected_offset_ms`, `combined_uncertainty_ms`, `selected_provider`, `selection_state`; 4 replica Family metrics; 4 Prometheus alert rules; downward API in deployment; 8 new tests | `cargo test replica` + `make e2e` |
 | **P1F-12** Marzullo / interval-intersection robustness follow-up to P1-6 | P1-followup | **done** | `src/ntp/selection.rs`, `src/config.rs`, `src/metrics.rs`, `src/main.rs`, `src/http/handlers.rs`, `tests/common/mod.rs` | Marzullo sweep pre-filter before weighted-median: truechimers/falsetickers, fail-closed on NoIntersection/AmbiguousCluster; `NTP_INTERVAL_SELECTION_ENABLED` config (default true); `IntersectionDiagnostics` in `/status` + `/time/full`; 5 new Prometheus metrics; 10 unit tests; 5 E2E tests | `cargo test ntp::selection && make e2e` |
-| **P2-9** Cleanup: drop `rsntp`, retire tautological test, document/expose bias knobs, rename `SelectionStrategy` | P2 | todo | `Cargo.toml`, `src/ntp/selection.rs`, `src/config.rs`, `src/http/handlers.rs` | `rsntp` removed; `rfc5905_four_tuple_relations_hold` replaced by real wire-parse test; bias knobs surfaced in `/status` | `cargo build && cargo test` |
+| **P2-9** Cleanup: confirm rsntp remains historical-only, retire tautological test, document/expose bias knobs, rename `SelectionStrategy` | P2 | todo | `src/ntp/selection.rs`, `src/config.rs`, `src/http/handlers.rs` | `rsntp` confirmed absent from tree; `rfc5905_four_tuple_relations_hold` replaced by real wire-parse test; bias knobs surfaced in `/status`; `SelectionStrategy` enum removed or renamed to remove confusion | `cargo build && cargo test` |
 | **DOC-1** Reconcile public docs (`README.md`, `CLAUDE.md`) with reality + this roadmap | P1 | **done** | `README.md`, `CLAUDE.md`, `PROJECT_ARCHITECTURE.md`, `PROJECT_PLAN.md` | No public doc claims unqualified "production-ready", "RTT-min", or rsntp-as-fine; admin API, selection metrics, NTP server config, remaining limitations all documented; test counts correct; P1-7/P1-6/P1F-12 marked done | `grep -nE "production-ready\|RTT-min\|SAMPLE_SERVERS_PER_SYNC\|UID 1000" README.md CLAUDE.md` → only intended hits |
-| **OPS-1** Track plan/docs in `.gitignore` | P2 | todo | `.gitignore` | `git check-ignore PROJECT_PLAN.md` empty; 3 plan docs + `CLAUDE.md` addable | `git check-ignore -v PROJECT_PLAN.md` |
+| **OPS-1** Track plan/docs in `.gitignore` | P2 | **done** | `.gitignore` | All plan docs (`PROJECT_PLAN.md`, `PROJECT_ARCHITECTURE.md`, `PRODUCTION_ACCURACY_PLAN.md`, `CLAUDE.md`) are tracked in git; `git check-ignore` returns nothing for them | `git check-ignore -v PROJECT_PLAN.md` → empty |
 | **OPS-2** Fix misleading `fcd8895` commit message | P2 | todo *(needs approval — pushed)* | git history | history attributes the change correctly; **no force-push without approval** (commit is pushed) | `git log --oneline -3` |
 
-> **Dependency order:** P0-1 → P0-2 → {P0-3 → P0-4, P1-6 → P1F-12}; P0-5 in parallel; P1-7 after P0-4 (+security review); P1-8 after P0-2. DOC-1 before OPS-1.
-> **On P1-7 priority (manual override).** It is a **core product requirement**, not optional future
-> work. It is sequenced *after* P0-4 **only because it technically depends on the time-quality
-> envelope** (so manual mode can surface `source:"manual"` and a conservative uncertainty) and
-> **must pass a dedicated security review** before merge — not because it is low importance. Treat it
-> as the highest-priority P1 (the "P0/P1 boundary"); start it the moment P0-4 lands.
-> **Human sign-off required** (see `PRODUCTION_ACCURACY_PLAN.md` §9): P1-7 **merge requires security review** (coding may start; contract is locked in §4 of the accuracy plan). D1/D2/D6/D8 decisions are now locked in the security contract. OPS-2 history rewrite still needs approval if force-push is desired.
+> **Completion order (historical):** P0-1 → P0-2 → {P0-3 → P0-4, P1-6 → P1F-12}; P0-5 in parallel; P1-7 after P0-4 (security review); P1-8 after P0-2. DOC-1/OPS-1 last. All P0/P1/P1F tasks are now complete.
+> **P1-7 (manual override).** Completed. Merged after dedicated security review. `subtle::ConstantTimeEq` token comparison; token never logged; 27 E2E tests green.
+> **OPS-2** history rewrite still needs approval if force-push is desired.
 
 ---
 
@@ -202,24 +196,6 @@ Resolved (no longer `#[allow(dead_code)]` in production):
 - `ntp_server_rtt_ms` field — renamed and no longer mismatched
 - `AppError::NtpError`, `AppError::Timeout` — removed entirely (3.1)
 - `NtpResult::t1..t4` — now consumed by sync loop and exposed via `/performance` (3.2)
-
----
-
----
-
-## Note: File Tracking
-
-`PROJECT_PLAN.md` and `PROJECT_ARCHITECTURE.md` are currently matched by the `*.md` glob in `.gitignore` (line 38) and are **not tracked by git**. To commit them:
-
-```bash
-# Option A: add explicit overrides to .gitignore
-echo '!PROJECT_PLAN.md' >> .gitignore
-echo '!PROJECT_ARCHITECTURE.md' >> .gitignore
-git add PROJECT_PLAN.md PROJECT_ARCHITECTURE.md
-
-# Option B: force-add (one-time, does not persist for future commits)
-git add -f PROJECT_PLAN.md PROJECT_ARCHITECTURE.md
-```
 
 ---
 

@@ -1,11 +1,8 @@
 # Production Accuracy & Reliability Plan (Implementation-Ready)
 
-> Status: **design / planning only — no code in this pass.** This revision turns the roadmap into
-> concrete, implementable engineering tasks: decided defaults, exact files, structs, functions,
-> tests, acceptance criteria, and validation commands.
+> Status: **Historical implementation plan + completion record.** P0/P1/P1F tasks (P0-1 through P0-5, P1-6, P1-7, P1-8, P1F-12) are complete unless otherwise noted. P2 tasks are pending cleanup work. Both files are tracked in git (OPS-1 done).
 >
-> Companion to `PROJECT_PLAN.md` (which now tracks these as real plan items). **Both files are
-> git-ignored** today; Task OPS-1 fixes that.
+> Companion to `PROJECT_PLAN.md` (which tracks these as real plan items).
 
 ---
 
@@ -343,8 +340,7 @@ stratum-1 source can outweigh a larger group of lower-tier peers.
 
 **Affected files.** `src/ntp/selection.rs`, `src/ntp/sync.rs`, `src/config.rs`, `src/metrics.rs`.
 
-**Config (additive).** `SELECTION_ALGO=weighted_median|intersection` (default flips to
-`intersection` once validated), `NTP_SOURCE_TIERS` (optional map server→tier).
+**Config (implemented).** `NTP_INTERVAL_SELECTION_ENABLED=true|false` (default `true`; enables Marzullo pre-filter). `SELECTION_ALGO` was a planning-time name; the actual implemented config var is `NTP_INTERVAL_SELECTION_ENABLED`. `NTP_SOURCE_TIERS` was deferred (not implemented in P1F-12).
 
 **Acceptance criteria.** The **independently-wrong-majority** adversarial test (3 distinct providers
 agree on a wrong offset, 1–2 correct) must **fail closed** — i.e. it MUST do at least one of:

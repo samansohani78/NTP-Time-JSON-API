@@ -3,10 +3,11 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > **Readiness & roadmap.** This is a production-oriented **general-purpose** time API; it is **not yet
-> financial/time-critical production-ready**. For any financial / latency-sensitive / authoritative
-> time-source work, you **must** follow the production-hardening roadmap in
-> `PRODUCTION_ACCURACY_PLAN.md` (P0/P1 tasks) and the status in `PROJECT_PLAN.md`. Current status:
-> P0-1/P0-2/P0-3/P0-4/P0-5/P1-6/P1-7/P1-8/P1F-12 complete. Next: P2-9 (if planned).
+> financial/time-critical production-ready**. P0/P1/P1F tasks are complete (P0-1 through P0-5, P1-6,
+> P1-7, P1-8, P1F-12). For financial / latency-sensitive / authoritative time-source work, additional
+> external items are required: NTS (authenticated NTP), host-clock discipline (chrony/ntpd), and a
+> formal SLA/security sign-off. See `PRODUCTION_ACCURACY_PLAN.md` and `PROJECT_PLAN.md` for history
+> and status. Next: P2-9 cleanup (if planned).
 
 ## Commands
 

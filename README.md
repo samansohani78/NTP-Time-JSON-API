@@ -1,31 +1,21 @@
 # NTP Time JSON API
 
-A **production-oriented, general-purpose** HTTP service that returns NTP-derived time as JSON, built
-with Rust 1.92. It is **not yet financial/time-critical production-ready** — that requires completing
-the P0 tasks in [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md).
+A **production-ready, general-purpose** HTTP service that returns NTP-derived time as JSON, built
+with Rust 1.92.
 
-> **Current limitations (see [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md)):**
-> - ~~Upstream T2/T3 reconstructed from offset/delay~~ — **fixed (P0-1/P0-2)**: T2/T3 and root
->   fields are now read directly from NTP packet bytes via the in-house `PacketNtpClient`.
-> - ~~UDP NTP server advertises `root_dispersion = 0`~~ — **fixed (P0-3)**: UDP replies now carry
->   honest `root_delay` (upstream + local RTT) and `root_dispersion` (RFC 5905 §11.2 formula:
->   upstream dispersion + precision + PHI×age + RTT/2, clamped to `MAX_ROOT_DISPERSION_MS`).
-> - ~~There is no time-quality / uncertainty envelope and no serve/stop SLA~~ — **fixed (P0-4)**:
->   `/status`, `/time/full`, quality response headers (`X-Time-Source`, `X-Time-Serve-State`,
->   `X-Time-Uncertainty-Ms`, `X-Time-Stratum`, `X-Time-Staleness-Ms`, `X-Time-Selected-Server`),
->   and the serve/stop policy (503 when uncertainty exceeds
->   `SERVE_OK_MAX_UNCERTAINTY_MS`/`SERVE_DEGRADED_MAX_UNCERTAINTY_MS`) are all live.
->   `/readyz` gates on `READINESS_MAX_UNCERTAINTY_MS` (250 ms default) after first sync.
-> - ~~There is no secure manual time-override path~~ — **done (P1-7)**: `/admin/time/override`
->   (POST/GET/DELETE) is live; requires `ADMIN_API_ENABLED=true` and `ADMIN_API_TOKEN`;
->   bearer-token auth with constant-time comparison; force, TTL, and jump-limit guards.
-> - ~~There is no full end-to-end CI~~ — **done (P0-5)**: real E2E harness (`tests/e2e_*.rs`)
->   exercises HTTP, UDP NTP, WebSocket, and metrics endpoints against an in-process server using a
->   mock NTP upstream; CI `e2e` job runs on every push. Use `make e2e` locally.
+> **Readiness.** Suitable as a general-purpose time API. **Not a financial/time-critical authoritative
+> time source** without NTS (authenticated upstream NTP), host-clock discipline (chrony/ntpd
+> integration), deployment access controls, and a formal SLA/security sign-off — none of which are
+> in scope here. See [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md) for details.
 >
-> For financial / latency-sensitive deployments, follow the P0/P1 roadmap in
-> [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md) before relying on this service as an
-> authoritative time source.
+> **Completed hardening (all P0/P1/P1F tasks done):**
+> - T2/T3 and root fields measured from NTP packet bytes (`PacketNtpClient`, P0-1/P0-2)
+> - UDP NTP server advertises honest `root_delay`/`root_dispersion` per RFC 5905 §11.2 (P0-3)
+> - Time-quality envelope: `/status`, `/time/full`, `X-Time-*` headers, serve/stop SLA (P0-4)
+> - Real E2E test harness + CI `e2e` job (P0-5)
+> - Marzullo interval-intersection + λ-weighted median + quorum selection (P1-6 + P1F-12)
+> - Secure manual time-override API with bearer-token auth (P1-7)
+> - Per-replica drift metrics and Prometheus alert rules (P1-8)
 
 ## Features
 
@@ -33,7 +23,7 @@ the P0 tasks in [`PRODUCTION_ACCURACY_PLAN.md`](PRODUCTION_ACCURACY_PLAN.md).
 - **High Performance**: Lightweight hot-path with cached NTP time, sub-millisecond response times
 - **Monotonic Time Model**: Guarantees time never goes backwards using `Instant::now()` + NTP base
 - **Multi-Server Support**: Queries all configured NTP servers each sync with accuracy-first selection and automatic failover
-- **Outlier Filtering**: Uses median offset calculation to reject divergent server responses
+- **Robust Selection**: Marzullo interval-intersection pre-filter (truechimers/falsetickers, fail-closed) + λ-weighted median + quorum gate + provider-group cap; min-RTT fallback removed
 - **Resilient**: Continues serving from cache if NTP sync fails after initial successful sync
 - **Kubernetes-Ready**: Includes liveness, readiness, and startup probes
 - **Prometheus Metrics**: Full observability with HTTP and NTP metrics
@@ -62,19 +52,20 @@ This ensures:
 
 ### NTP Strategy
 
-- **Selection**: accuracy-first / median-consensus based — picks the server whose offset is closest
-  to the consensus (median) offset; **RTT is only a tiebreaker**. (The `SELECTION_STRATEGY=rtt_min`
-  env value is a backwards-compatible alias for this algorithm, not "lowest RTT".)
-- **Sampling**: Queries **all** configured servers each sync (in parallel), then selects.
-- **Outlier Filtering**: Rejects servers beyond `MAX_OFFSET_SKEW_MS` from median
-- **Failover**: Automatically tries backup servers if primary fails
-- **Sync Interval**: Background sync every 30 seconds (configurable)
-- **Probe Loop**: Separate jittered loop for keeping server stats fresh
+Each sync cycle queries **all** configured servers in parallel via `PacketNtpClient` (async UDP),
+then applies a multi-stage selection pipeline (`src/ntp/selection.rs`):
 
-> **Done (P1-6 + P1F-12):** The weighted-median selector (`WeightedMedianSelector`) with per-sample
-> root-distance λ scoring, quorum gate, and provider-group cap is live. Marzullo
-> interval-intersection pre-filter (P1F-12) runs before the weighted-median step: falsetickers are
-> discarded and competing clusters fail closed. See `src/ntp/selection.rs`.
+1. **Hard gates** — reject servers with leap alarm, stratum ≥ `MAX_STRATUM`, root distance > `MAX_ROOT_DISTANCE_MS`, or stale samples.
+2. **Marzullo interval-intersection** (`NTP_INTERVAL_SELECTION_ENABLED=true`) — build `[θ−λ, θ+λ]` intervals; sweep to find the single significant cluster; discard falsetickers; fail closed if no cluster meets `MIN_QUORUM` or if multiple competing clusters exist (`AmbiguousCluster`).
+3. **λ-weighted median** — among truechimers, compute the weighted-median consensus offset.
+4. **Quorum gate** — at least `MIN_QUORUM` (default 2) servers must agree with the median.
+5. **Provider-group cap** — if one DNS provider supplies > 50% of agreers, combined uncertainty is doubled.
+6. **No min-RTT fallback** — if no quorum or no intersection, sync fails and previous good timebase is preserved; RTT is only a tiebreaker among equal-accuracy candidates.
+
+- **Sync Interval**: Background sync every 30 seconds (configurable via `SYNC_INTERVAL`)
+- **Probe Loop**: Separate jittered loop (`PROBE_MIN_INTERVAL`..`PROBE_MAX_INTERVAL`) for keeping per-server RTT stats fresh
+- **Sticky selection**: Switches server only if new best is 50 ms+ faster; avoids unnecessary churn
+- **`SELECTION_STRATEGY=rtt_min`**: Backwards-compatible alias accepted; algorithm is accuracy-first, not RTT-min
 
 ### Probe Behavior
 

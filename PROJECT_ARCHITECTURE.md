@@ -3,13 +3,10 @@
 Single source of truth for understanding the NTP Time JSON API project **as it exists today**
 (current state, not future state).
 
-> **For financial / time-critical deployments, see `PRODUCTION_ACCURACY_PLAN.md`.** Current
-> limitations (P0-1/P0-2/P0-3/P0-4/P0-5 complete — T2/T3 and root fields measured from packet
-> bytes; UDP NTP server advertises honest `root_delay`/`root_dispersion` per RFC 5905 §11.2;
-> time-quality envelope, `/status`, `/time/full`, serve/stop policy, and quality headers live;
-> real E2E test harness and CI `e2e` job in place):
-> there is **no secure manual-override** path (P1-7).
-> This is tracked as the P1 roadmap in `PRODUCTION_ACCURACY_PLAN.md`.
+> **Readiness.** This service is production-ready as a general-purpose time API (P0/P1/P1F
+> roadmap complete). It is **not a financial/time-critical authoritative time source** without NTS
+> (authenticated upstream NTP), host-clock discipline (chrony/ntpd integration), deployment access
+> controls, and a formal SLA/security sign-off. See `PRODUCTION_ACCURACY_PLAN.md` for details.
 
 ---
 
@@ -21,13 +18,12 @@ stored in a lock-free monotonic `TimeBase`, and served from a pre-serialized JSO
 also optionally acts as a **Stratum-2 UDP NTP server** for downstream clients. Designed for
 Kubernetes with proper health probes and Prometheus metrics.
 
-**Readiness qualification.** This is suitable today as a general-purpose time API. It is **not yet
-financial/time-critical production ready** — that requires completing P1-7 (manual override) and
-reviewing the P1 roadmap in `PRODUCTION_ACCURACY_PLAN.md`. P0-1 through P0-5 are complete: T1–T4
-are all measured, `rsntp` is removed, UDP NTP responses carry honest dispersion, the time-quality
-envelope (`/status`, `/time/full`, serve/stop policy, quality headers) is live, and a real E2E
-test harness runs in CI.
-The architecture described below is the **current state**.
+**Readiness qualification.** Production-ready as a general-purpose time API. The full P0/P1/P1F
+hardening roadmap is complete: T1–T4 measured from packet bytes, `rsntp` removed, honest UDP NTP
+dispersion, time-quality envelope live, real E2E harness in CI, Marzullo interval-intersection
+selection (P1F-12), secure manual-override API (P1-7), and replica-drift metrics (P1-8).
+Not a financial/time-critical authoritative source without NTS, host-clock discipline, and SLA
+sign-off — see `PRODUCTION_ACCURACY_PLAN.md`. The architecture described below is **current state**.
 
 ---
 
@@ -62,30 +58,33 @@ The architecture described below is the **current state**.
 │   ├── metrics.rs       Prometheus registry + all metric definitions
 │   ├── performance.rs   TimeCache (zero-copy JSON) + LockFreeMetrics
 │   ├── http/
-│   │   ├── mod.rs       Router: fast path / slow path split, rate limiting, CORS
-│   │   ├── handlers.rs  HTTP endpoint implementations
-│   │   ├── middleware.rs Prometheus metrics tracking middleware
-│   │   ├── state.rs     AppState (shared across all handlers)
-│   │   └── websocket.rs WebSocket streaming endpoint (/stream)
+│   │   ├── mod.rs           Router: fast path / slow path split, rate limiting, CORS
+│   │   ├── handlers.rs      HTTP endpoint implementations (/time, /status, /time/full, probes, metrics)
+│   │   ├── handlers_admin.rs Admin API (/admin/time/override POST/GET/DELETE; P1-7)
+│   │   ├── middleware.rs    Prometheus metrics tracking + admin bearer-token auth
+│   │   ├── state.rs         AppState (shared across all handlers)
+│   │   └── websocket.rs     WebSocket streaming endpoint (/stream)
 │   └── ntp/
 │       ├── mod.rs       Public re-exports
 │       ├── protocol.rs  RFC 5905 NTP packet encode/decode (pure, no I/O)
-│       ├── selection.rs Outlier-filtered, accuracy-first server selection
+│       ├── selection.rs Marzullo intersection + λ-weighted median + quorum (P1-6/P1F-12)
 │       ├── stats.rs     Per-server health tracking (failures, RTT, auto-disable)
 │       ├── sync.rs      NtpSyncer: parallel queries + sticky server selection
 │       └── server.rs    UDP NTP server (Stratum 2, responds to NTP clients)
 ├── tests/
-│   ├── common/mod.rs        E2E test helpers (mock NTP, spawn server, UDP helpers)
-│   ├── e2e_http.rs          HTTP endpoint E2E tests (14 tests)
-│   ├── e2e_ntp_udp.rs       UDP NTP server E2E tests (3 tests)
-│   ├── e2e_websocket.rs     WebSocket streaming E2E tests (2 tests)
-│   ├── e2e_metrics.rs       Prometheus metrics scrape E2E tests (3 tests)
-│   └── integration_api.rs   Redirect comment → e2e_*.rs (placeholder removed)
+│   ├── common/mod.rs            E2E helpers (mock NTP upstream, spawn helpers, apply_sync_to_state)
+│   ├── e2e_http.rs              HTTP E2E tests (23 tests; P0-4/P1-6/P1-7/P1-8/P1F-12 coverage)
+│   ├── e2e_ntp_udp.rs           UDP NTP server E2E tests (3 tests)
+│   ├── e2e_websocket.rs         WebSocket streaming E2E tests (2 tests)
+│   ├── e2e_metrics.rs           Prometheus metrics E2E tests (11 tests; incl. selection/intersection/replica)
+│   ├── e2e_manual_override.rs   Admin manual-override E2E tests (27 tests; P1-7)
+│   └── integration_api.rs       Redirect comment → e2e_*.rs (placeholder removed)
 ├── k8s/
-│   ├── deployment.yaml  3 replicas, probes, resources, NET_BIND_SERVICE
-│   ├── service.yaml     ClusterIP, TCP:80→8080, UDP:123
-│   ├── configmap.yaml   NTP server list
-│   └── servicemonitor.yaml  Prometheus Operator scrape config
+│   ├── deployment.yaml       3 replicas, probes, resources, NET_BIND_SERVICE, REPLICA_ID downward API
+│   ├── service.yaml          ClusterIP, TCP:80→8080, UDP:123
+│   ├── configmap.yaml        NTP server list (12 servers)
+│   ├── servicemonitor.yaml   Prometheus Operator scrape config
+│   └── prometheus-rules.yaml 4 alert rules for replica drift (P1-8)
 ├── .github/workflows/ci.yml  CI: fmt + clippy + test + build + audit + docker
 ├── Dockerfile           Multi-stage: rust:1.92-bookworm → distroless
 ├── docker-compose.yml   Single-service compose with 24 NTP servers + Persian messages
@@ -110,7 +109,7 @@ flowchart TD
 
     D -->|every SYNC_INTERVAL secs| I[NtpSyncer::sync]
     I --> J[Query all servers in parallel via PacketNtpClient]
-    J --> K[ServerSelector::select_best_result]
+    J --> K[WeightedMedianSelector::select]
     K --> L[TimeBase::update]
     L --> M[AppState::record_sync_success]
 
@@ -181,6 +180,9 @@ Shared across all Axum handlers via `Arc<AppState>`. Cloned cheaply per request.
 | GET | `/startupz` | none | Startup: 503 until first sync (if `REQUIRE_SYNC=true`) |
 | GET | `/metrics` | none | Prometheus text exposition |
 | GET | `/performance` | none | JSON: latency min/avg/max, cache hit rate, error rate, and `ntp_timing` (RFC 5905 T1-T4; null before first sync) |
+| POST | `/admin/time/override` | Bearer token | Set manual time override (P1-7; only when `ADMIN_API_ENABLED=true`) |
+| GET | `/admin/time/override` | Bearer token | Get current override state |
+| DELETE | `/admin/time/override` | Bearer token | Clear active override |
 
 ### Fast path vs Slow path
 
@@ -217,16 +219,18 @@ Shared across all Axum handlers via `Arc<AppState>`. Cloned cheaply per request.
 
 1. **`NtpSyncer::sync()`** queries ALL configured servers in parallel (Tokio tasks).
 2. Each query uses `PacketNtpClient::query` (async UDP; `src/ntp/client.rs`) wrapped with `tokio::time::timeout`. T2/T3/root_delay/root_dispersion/precision are read directly from the NTP packet bytes — not reconstructed.
-3. Results collected → **`ServerSelector::select_best_result()`** runs outlier filtering.
+3. Results collected → **`WeightedMedianSelector::select()`** runs the multi-stage pipeline.
 4. **Smart sticky**: switches server only if the new best is 50ms+ faster; otherwise keeps current server for stability.
 
-### Server Selection Algorithm (`src/ntp/selection.rs`)
+### Server Selection Algorithm (`src/ntp/selection.rs`) — P1-6 + P1F-12
 
-1. Compute **median offset** across all successful servers.
-2. Reject servers where `|offset - median| > MAX_OFFSET_SKEW_MS` (default 1000ms).
-3. Among inliers, pick server **closest to median offset** (accuracy-first).
-4. RTT is only a tiebreaker when accuracy is equal.
-5. Fallback: if all servers are outliers (network issues), use min-RTT server.
+1. **Hard gates** — reject samples with leap alarm (LI=3), stratum ≥ `MAX_STRATUM` (default 4), root distance > `MAX_ROOT_DISTANCE_MS` (default 500 ms), or age > `MAX_SAMPLE_AGE_SECS` (default 60).
+2. **Marzullo interval-intersection** (when `NTP_INTERVAL_SELECTION_ENABLED=true`, default) — for each candidate build `[θ−λ, θ+λ]` where λ = root_delay/2 + root_dispersion + rtt/2 + jitter + |precision| + PHI×age. Sweep events to find significant clusters (overlap depth ≥ `MIN_QUORUM`). Fail closed if 0 clusters (`NoIntersection`) or ≥ 2 clusters (`AmbiguousCluster`). Truechimers are candidates whose intervals span the peak region; falsetickers are discarded.
+3. **λ-weighted median** — weight = 1/(λ+1); weighted median determines consensus offset on truechimers.
+4. **Agreement check** — servers within `MAX_OFFSET_SKEW_MS` (default 1000 ms) of the weighted-median offset are "agreers".
+5. **Quorum gate** — `len(agreers) ≥ MIN_QUORUM` (default 2); failure → `SelectionState::NoQuorum`, sync fails, previous timebase preserved. **No min-RTT fallback.**
+6. **Provider-group cap** — last 2 DNS labels = provider group; if one group > 50% of agreers → `single_provider=true`, `combined_uncertainty ×2`.
+7. **Combined uncertainty** = `max(best.lambda, intersection_radius)` × 2 if single_provider.
 
 ### RFC 5905 Four-Tuple
 
@@ -266,15 +270,34 @@ All configuration is read once at startup via `Config::from_env()`.
 | `PROBE_MAX_INTERVAL` | `20` | Probe loop max jitter (seconds) |
 | `MAX_STALENESS` | `120` | Staleness threshold for `MSG_OK_CACHE` |
 | `REQUIRE_SYNC` | `true` | Block `/time` until first NTP sync |
-| `SELECTION_STRATEGY` | `rtt_min` | Only `rtt_min` (or `accuracy_first`) accepted; algorithm is accuracy-first, RTT as tiebreaker |
+| `SELECTION_STRATEGY` | `rtt_min` | Backwards-compat alias only; algorithm is always accuracy-first (`WeightedMedianSelector`) regardless of value |
 | `MAX_OFFSET_SKEW_MS` | `1000` | Outlier rejection threshold |
+| `MIN_QUORUM` | `2` | Minimum agreers required for a valid sync; Marzullo sweep requires depth ≥ this value |
+| `MAX_STRATUM` | `4` | Hard-reject candidates at or above this stratum |
+| `REJECT_LEAP_ALARM` | `true` | Hard-reject candidates with LI=3 |
+| `MAX_ROOT_DISTANCE_MS` | `500` | Hard-reject candidates with root distance above this |
+| `MAX_SAMPLE_AGE_SECS` | `60` | Hard-reject candidates whose sample is older than this |
+| `PROVIDER_GROUP_MAX_FRACTION` | `0.5` | Fraction of agreers from one provider group that triggers single_provider inflation |
+| `NTP_PROVIDER_GROUPS` | `` | Comma-separated `server=group` overrides for provider-group assignment |
+| `NTP_INTERVAL_SELECTION_ENABLED` | `true` | Enable Marzullo interval-intersection pre-filter (P1F-12); set false for weighted-median only |
 | `MONOTONIC_OUTPUT` | `true` | Clamp time to never go backwards |
 | `OFFSET_BIAS_MS` | `0` | Manual global time offset |
 | `ASYMMETRY_BIAS_MS` | `0` | Network asymmetry compensation |
 | `MAX_CONSECUTIVE_FAILURES` | `10` | Failures before server auto-disable |
+| `ALLOW_DEGRADED` | `false` | Return time at degraded quality when uncertainty exceeds threshold |
+| `SERVE_OK_MAX_UNCERTAINTY_MS` | `50` | Max uncertainty (ms) for `serve_state=ok`; above this, 503 if `ALLOW_DEGRADED=false` |
+| `SERVE_DEGRADED_MAX_UNCERTAINTY_MS` | `500` | Max uncertainty (ms) for `serve_state=degraded` |
+| `READINESS_MAX_UNCERTAINTY_MS` | `250` | Uncertainty threshold above which `/readyz` returns 503 after first sync |
+| `REPLICA_ID` | `$HOSTNAME` or `replica-<pid>` | Identity label for per-replica Prometheus metrics; set via k8s downward API |
 | `NTP_SERVER_ENABLED` | `false` | Enable UDP NTP server |
 | `NTP_SERVER_ADDR` | `0.0.0.0:123` | UDP bind address (requires `CAP_NET_BIND_SERVICE`) |
 | `NTP_SERVER_MAX_PACKET_SIZE` | `1024` | Max UDP packet accepted |
+| `ADMIN_API_ENABLED` | `false` | Enable `/admin/time/override` endpoints (P1-7) |
+| `ADMIN_API_TOKEN` | _(required if enabled)_ | Bearer token for admin endpoints; never logged |
+| `MANUAL_OVERRIDE_MAX_TTL_SECS` | `300` | Maximum allowed override TTL |
+| `MANUAL_OVERRIDE_MAX_JUMP_MS` | `5000` | Maximum allowed time jump in an override |
+| `MANUAL_OVERRIDE_ALLOW_FORCE` | `false` | Allow `force=true` in override requests |
+| `MANUAL_OVERRIDE_DISPERSION_MS` | `1000` | Dispersion advertised while a manual override is active |
 | `WS_UPDATE_INTERVAL_MS` | `1000` | WebSocket tick interval |
 | `WS_MAX_DURATION_SECS` | `3600` | Max WebSocket connection lifetime (0 = unlimited) |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
@@ -312,6 +335,38 @@ All configuration is read once at startup via `Config::from_env()`.
 - `ntp_udp_server_errors_total` — counter (malformed packets, send failures, rate-limited drops)
 - `ntp_udp_server_unsynced_responses_total` — counter (LI=3, Stratum=16 responses sent while unsynced)
 
+**Selection / uncertainty (P1-6):**
+- `ntp_selection_quorum_size` — agreers count on last sync
+- `ntp_selection_falsetickers_total` — cumulative hard-rejected candidates
+- `ntp_selection_rejected_total{reason}` — per-reason rejection counter
+- `ntp_sample_uncertainty_milliseconds{server}` — per-upstream λ at last sync
+- `ntp_combined_uncertainty_milliseconds` — selected uncertainty after provider-cap
+- `ntp_selection_single_provider` — 1 when one provider dominates
+
+**Interval-intersection (P1F-12):**
+- `ntp_intersection_truechimers` — truechimer count after sweep
+- `ntp_intersection_falsetickers_total` — cumulative falseticker count
+- `ntp_intersection_width_milliseconds` — intersection region width (ms)
+- `ntp_intersection_failures_total{reason}` — `no_intersection` / `ambiguous_cluster`
+- `ntp_intersection_ambiguous_clusters` — competing cluster count
+
+**Manual override (P1-7):**
+- `manual_override_active` — 1 while active
+- `manual_override_total` — cumulative set count
+- `manual_override_expiry_timestamp_seconds` — Unix expiry; 0 if none
+- `manual_override_rejected_total{reason}` — rejected requests by reason
+
+**Time-quality envelope (P0-4):**
+- `time_uncertainty_milliseconds` — computed uncertainty (ms) from last sync
+- `time_source_mode` — 0=ntp, 1=degraded, 2=unsynced, 3=manual
+- `time_serve_state` — 0=ok, 1=degraded, 2=stopped, 3=unsynced
+
+**Replica drift (P1-8, all labeled `{replica_id}`):**
+- `time_replica_offset_milliseconds` — NTP offset from last sync
+- `time_replica_uncertainty_milliseconds` — combined uncertainty
+- `time_replica_serve_state` — serve state encoding (see time-quality above)
+- `time_replica_source_mode` — source mode encoding (see time-quality above)
+
 **Build:** `build_info{version,git_sha}` — set at startup; `git_sha` is `"unknown"` on local builds.
 
 ---
@@ -337,7 +392,7 @@ Every source module has tests:
 - `http/mod.rs`: router creation, healthz endpoint via tower `oneshot`
 - `websocket.rs`: ISO8601 formatting
 - `ntp/protocol.rs`: parse/serialize, epoch conversion, error cases, roundtrip
-- `ntp/selection.rs`: single server, outlier filtering, accuracy-first, RTT tiebreaker, RFC 5905 four-tuple math
+- `ntp/selection.rs`: 27 adversarial unit tests covering hard gates, Marzullo sweep, λ-weighted median, quorum gate, provider-group cap, diagnostics surface, and failure modes (low-RTT-wrong-offset, all-disagree, NoQuorum, NoIntersection, AmbiguousCluster)
 - `ntp/stats.rs`: full server lifecycle (enable/disable/re-enable)
 - `ntp/sync.rs`: syncer creation; `sticky_select` pure function (6 tests covering all decision paths)
 - `ntp/server.rs`: synced/unsynced response via real UDP loopback; `root_delay` propagation; `UdpRateLimiter` (4 tests)
@@ -356,12 +411,13 @@ network required.
 
 | Binary | Tests | Coverage |
 |---|---|---|
-| `e2e_http.rs` | 14 | `/time`, `/time/full`, `/status`, `/readyz`, `/startupz`, `/healthz`, `/performance`; pre/post sync; quality headers |
+| `e2e_http.rs` | 23 | `/time`, `/time/full`, `/status`, `/readyz`, `/startupz`, `/healthz`, `/performance`; pre/post sync; quality headers; replica fields; intersection diagnostics; P0-4/P1-6/P1-7/P1-8/P1F-12 |
 | `e2e_ntp_udp.rs` | 3 | Synced/unsynced UDP NTP server responses; origin timestamp echo; RFC 5905 fields |
 | `e2e_websocket.rs` | 2 | Welcome + tick messages; monotonic `epoch_ms` |
-| `e2e_metrics.rs` | 3 | Core, quality-envelope, and UDP-server Prometheus families |
+| `e2e_metrics.rs` | 11 | Core, quality-envelope, UDP-server, selection, intersection, and replica Prometheus families |
+| `e2e_manual_override.rs` | 27 | Admin override POST/GET/DELETE; TTL expiry; token auth; force flag; degraded metrics (P1-7; run separately) |
 
-Run with `make e2e` (or `cargo test --test e2e_http --test e2e_ntp_udp --test e2e_websocket --test e2e_metrics`).
+`make e2e` runs the first four binaries (39 tests). The manual override suite runs separately: `cargo test --test e2e_manual_override`.
 
 ### External scripts
 - `test_api.sh` — bash script testing all HTTP endpoints against a running service
@@ -511,8 +567,8 @@ Test-only methods are in `#[cfg(test)]` impl blocks (not `#[allow(dead_code)]`):
 
 ## Known Risks and Fragile Areas
 
-### 1. Only one `SelectionStrategy` variant
-`config.rs` defines `SelectionStrategy::AccuracyFirst` as the only variant (env-var value `"rtt_min"` or `"accuracy_first"`). Any other string is a hard startup failure. The algorithm is accuracy-first (closest to consensus offset), with RTT as tiebreaker.
+### 1. `SELECTION_STRATEGY` is a backwards-compat alias only
+The env-var is still accepted but the algorithm is always `WeightedMedianSelector` (accuracy-first: Marzullo + λ-weighted median + quorum). `SelectionStrategy::AccuracyFirst` is the only parsed variant; any other string is a hard startup failure.
 
 ### 2. ~~UDP NTP server `root_dispersion=0`~~ — fixed (P0-3)
 UDP replies now carry honest `root_delay` and `root_dispersion` sourced from `AppState::last_sync_quality` (populated each sync by P0-2). Formula (RFC 5905 §11.2):
@@ -535,7 +591,7 @@ Image is built and Trivy-scanned but never pushed to any registry. Manual `docke
 1. **Start with `src/timebase.rs`** — the entire service exists to keep this lock-free time counter accurate. Understand it before touching anything else.
 2. **`src/http/handlers.rs` `time_handler`** is the hot path. Any change there must preserve the zero-alloc JSON cache path.
 3. **`src/ntp/sync.rs` `NtpSyncer::sync()`** is where NTP queries happen. Note the sticky server logic — `current_server` persists between sync cycles.
-4. **`src/ntp/selection.rs` `ServerSelector::select_best_result()`** — accuracy-first, not RTT-first. Don't confuse with the `SelectionStrategy::RttMin` name.
+4. **`src/ntp/selection.rs` `WeightedMedianSelector::select()`** — accuracy-first pipeline: hard gates → Marzullo sweep → λ-weighted median → quorum gate. No min-RTT fallback.
 5. **Config is immutable at runtime** — all env vars in `src/config.rs`. `Config::default()` exists only for tests.
 6. **`AppState`** carries everything handlers need. Adding new state requires updating `AppState::new()` and `main.rs`.
 7. **Rate limiting is off in tests** — `create_router_for_test()` skips `GovernorLayer`. Don't rely on rate limit behavior in unit tests.
